@@ -4,6 +4,12 @@ A starting point for C# repositories: central package management, a strict
 `.editorconfig`, cross-platform CI, CodeQL, an optional NuGet release pipeline,
 and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 
+> **AI agents:** before initializing a repo from this template, read
+> [docs/AGENT-INIT-GUIDE.md](docs/AGENT-INIT-GUIDE.md). It captures the mistakes
+> past initialization sessions made (assuming the layout instead of reading it,
+> mixing shells, fighting the permission model) and is a living document you are
+> expected to extend when new mistakes happen.
+
 ## Using this template
 
 1. Create a new repository from this one (GitHub: **Use this template**), or copy

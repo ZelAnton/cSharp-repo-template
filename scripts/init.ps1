@@ -6,8 +6,8 @@
 .DESCRIPTION
     Replaces the placeholder tokens (__ProjectName__, __Author__, __GitHubOwner__,
     __Description__, __Year__) in file contents AND in file/folder names, then
-    removes the template-only files (TEMPLATE.md and, unless -KeepScript, this
-    script itself).
+    removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md, and,
+    unless -KeepScript, this script itself).
 
     Run it once, right after creating a repository from the template:
 
