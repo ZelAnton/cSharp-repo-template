@@ -1,0 +1,22 @@
+<Project>
+	<PropertyGroup>
+		<!-- Repository root — MSBuildThisFileDirectory is the directory containing this file (with trailing separator). -->
+		<RepoRoot>$(MSBuildThisFileDirectory)</RepoRoot>
+		<!-- Absolute path to the main library project directory. Reference it from any
+		     .csproj/.props/.targets that needs a path outside its own directory instead
+		     of writing ..\..\ — see CLAUDE.md / AGENTS.md "MSBuild Path Properties". -->
+		<MainProjectDir>$(RepoRoot)src\__ProjectName__\</MainProjectDir>
+	</PropertyGroup>
+
+	<PropertyGroup>
+		<AnalysisLevel>latest-recommended</AnalysisLevel>
+		<LangVersion>latest</LangVersion>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+		<EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+		<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+		<RepositoryType>git</RepositoryType>
+		<SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+	</PropertyGroup>
+</Project>

@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<AssemblyName>__ProjectName__</AssemblyName>
+
+		<PackageId>__ProjectName__</PackageId>
+		<Version>0.1.0</Version>
+		<Authors>__Author__</Authors>
+		<Copyright>Copyright (c) __Year__ __Author__</Copyright>
+		<Description>__Description__</Description>
+		<!-- <PackageTags>tag1;tag2</PackageTags> -->
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<PackageReleaseNotes Condition="Exists('$(RepoRoot)release-notes.md')">$([System.IO.File]::ReadAllText('$(RepoRoot)release-notes.md'))</PackageReleaseNotes>
+
+		<PackageProjectUrl>https://github.com/__GitHubOwner__/__ProjectName__</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/__GitHubOwner__/__ProjectName__</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<EmbedUntrackedSources>true</EmbedUntrackedSources>
+
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+		<Deterministic>true</Deterministic>
+		<ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Include="$(RepoRoot)README.md" Pack="true" PackagePath="\" />
+		<None Include="$(RepoRoot)CHANGELOG.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="All" />
+	</ItemGroup>
+
+</Project>
