@@ -29,7 +29,7 @@ jobs:
       # release actor a bypass (Settings -> Branches -> allow a GitHub App / Actions
       # to bypass), or add a RELEASE_TOKEN secret (a PAT or App token that can bypass
       # protection) — it is preferred over GITHUB_TOKEN below when present.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 0
