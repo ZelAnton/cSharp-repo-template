@@ -71,6 +71,9 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
   `.github/PULL_REQUEST_TEMPLATE.md`, and `.github/CODEOWNERS`. Edit them to taste;
   delete any you don't want. `CODEOWNERS` ships with its rule commented out — see
   the note inside before enabling it (it must reference a real user/team).
+- **YAML linting** — `.yamllint.yml` is tuned for GitHub Actions, and the CI
+  `yaml-lint` job runs it on every push/PR. Run it locally with `yamllint .` (or
+  `py -m yamllint .` on Windows). Delete the file and the job if you don't want it.
 
 ## Security hardening (on by default)
 
