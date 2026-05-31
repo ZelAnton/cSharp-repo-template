@@ -18,5 +18,14 @@
 		<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
 		<RepositoryType>git</RepositoryType>
 		<SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+		<!-- Audit direct AND transitive dependencies against the NuGet advisory
+		     database on restore. NU1901-1904 (vulnerability) findings stay
+		     warnings here on purpose: with TreatWarningsAsErrors a freshly
+		     disclosed CVE would otherwise break every build until a fix ships.
+		     Promote them to errors per project if you want a hard gate. -->
+		<NuGetAudit>true</NuGetAudit>
+		<NuGetAuditMode>all</NuGetAuditMode>
+		<WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
 	</PropertyGroup>
 </Project>

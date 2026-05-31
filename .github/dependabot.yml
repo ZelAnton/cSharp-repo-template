@@ -10,6 +10,11 @@ updates:
       interval: weekly
     commit-message:
       prefix: CI
+    groups:
+      # One PR per weekly run for all action bumps, instead of one PR per action.
+      github-actions:
+        patterns:
+          - "*"
 
   - package-ecosystem: nuget
     directory: /

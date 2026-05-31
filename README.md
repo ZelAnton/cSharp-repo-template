@@ -44,6 +44,12 @@ inspect it with `dotnet nuget verify __ProjectName__.<version>.nupkg --all`.
 
 See [CHANGELOG.md](CHANGELOG.md) for the version history.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build/test instructions and
+conventions. To report a security issue, follow [SECURITY.md](SECURITY.md) —
+please do not open a public issue.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

@@ -64,8 +64,31 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
   older SDK gets a clear error instead of confusing analyzer failures. Bump it when
   you move to a newer band; delete it to always use whatever SDK is installed.
 - **Dependency updates** — `.github/dependabot.yml` opens weekly PRs to bump GitHub
-  Actions and the central NuGet versions in `Directory.Packages.props`. Remove it
-  if you update dependencies by hand.
+  Actions and the central NuGet versions in `Directory.Packages.props`. Action and
+  NuGet bumps are each grouped into a single weekly PR. Remove it if you update
+  dependencies by hand.
+- **Community-health files** — `SECURITY.md`, `CONTRIBUTING.md`,
+  `.github/PULL_REQUEST_TEMPLATE.md`, and `.github/CODEOWNERS`. Edit them to taste;
+  delete any you don't want. `CODEOWNERS` ships with its rule commented out — see
+  the note inside before enabling it (it must reference a real user/team).
+
+## Security hardening (on by default)
+
+- **Pinned actions** — every GitHub Action is pinned to a full commit SHA (with a
+  `# vN` comment), not a moving tag. Dependabot bumps the SHA and rewrites the
+  comment. This blocks a re-tagged-action supply-chain attack.
+- **Dependency auditing** — `Directory.Build.props` sets `NuGetAudit`/`NuGetAuditMode=all`
+  so direct *and* transitive packages are checked against the NuGet advisory
+  database on restore. Vulnerability findings stay warnings (not build-breaking
+  errors) so a freshly disclosed CVE doesn't block every build; promote them per
+  project for a hard gate.
+- **NuGet Trusted Publishing (OIDC)** — the release workflow uses a long-lived
+  `NUGET_API_KEY` by default, but documents how to switch to short-lived OIDC
+  tokens (no stored secret). See the comment above the *Push to NuGet.org* step in
+  `.github/workflows/release.yml`.
+- **Release ordering** — the workflow pushes the git commit/tag *before* publishing
+  to NuGet, so a blocked git push (e.g. branch protection) can't leave an orphaned,
+  un-tagged package on the registry.
 
 ## Recommended add-ons (not enabled by default)
 
@@ -86,9 +109,12 @@ project.
 
 ## Post-setup checklist
 
-- [ ] `NUGET_API_KEY` repo secret added (only if publishing to NuGet).
+- [ ] `NUGET_API_KEY` repo secret added (only if publishing to NuGet), or
+      NuGet Trusted Publishing (OIDC) configured — see `release.yml`.
 - [ ] LICENSE author/year and license choice reviewed.
 - [ ] `.csproj` package metadata (description, tags, URLs) filled in.
+- [ ] `SECURITY.md` reporting contact reviewed; `.github/CODEOWNERS` enabled if wanted.
+- [ ] GitHub **Settings → Security → Private vulnerability reporting** enabled (for `SECURITY.md`).
 - [ ] `CLAUDE.md` "Architecture" section written for your project.
 - [ ] Branch protection / required checks configured for `main` (CI, CodeQL).
       If you require PRs or status checks on `main`, the release workflow's push of
