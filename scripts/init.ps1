@@ -131,9 +131,18 @@ if (Test-Path $claudeTemplate) {
     Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
 }
 
-# 4) Remove template-only files.
-$templateDoc = Join-Path $repoRoot 'TEMPLATE.md'
-if (Test-Path $templateDoc) { Remove-Item -LiteralPath $templateDoc -Force }
+# 4) Remove template-only files — documentation that only applies while this is a
+#    template, not after it has been stamped into a concrete project.
+$templateOnly = @(
+    (Join-Path $repoRoot 'TEMPLATE.md'),
+    (Join-Path $repoRoot 'docs/AGENT-INIT-GUIDE.md')
+)
+foreach ($path in $templateOnly) {
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force
+        Write-Host "    Removed $($path.Substring($repoRoot.Length).TrimStart('\','/'))" -ForegroundColor DarkGray
+    }
+}
 
 Write-Host ""
 Write-Host "Done. Next steps:" -ForegroundColor Green

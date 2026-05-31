@@ -1,0 +1,27 @@
+version: 2
+
+# Keep GitHub Actions and NuGet dependencies current. The nuget ecosystem reads
+# central package versions from Directory.Packages.props; the github-actions
+# ecosystem bumps the action tags pinned in .github/workflows/*.yml.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: CI
+
+  - package-ecosystem: nuget
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: Update
+    groups:
+      # One PR per weekly run for routine bumps keeps the changelog auto-fill tidy.
+      nuget-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

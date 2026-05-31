@@ -59,6 +59,30 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
   `docs/linux-testing.md` if you don't need to run the Linux code path locally.
 - **Rider settings** — delete `__ProjectName__.sln.DotSettings` if you don't use
   Rider/ReSharper.
+- **SDK pin** — `global.json` pins the .NET SDK feature band (10.0.1xx and up via
+  `rollForward: latestFeature`) so builds are reproducible and a contributor on an
+  older SDK gets a clear error instead of confusing analyzer failures. Bump it when
+  you move to a newer band; delete it to always use whatever SDK is installed.
+- **Dependency updates** — `.github/dependabot.yml` opens weekly PRs to bump GitHub
+  Actions and the central NuGet versions in `Directory.Packages.props`. Remove it
+  if you update dependencies by hand.
+
+## Recommended add-ons (not enabled by default)
+
+These are intentionally left off so the template stays general; turn them on per
+project.
+
+- **AOT / trim safety** — if the library should be Native-AOT and trim friendly,
+  add `<IsAotCompatible>true</IsAotCompatible>` to the library `.csproj`. It turns
+  on the trim/AOT/single-file analyzers, so (with warnings-as-errors) reflection or
+  other AOT-unsafe patterns become build errors. For end-to-end verification add a
+  small `tests/__ProjectName__.AotSmoke` project with `<PublishAot>true</PublishAot>`
+  and a CI job that `dotnet publish`es it.
+- **XML documentation in the package** — add
+  `<GenerateDocumentationFile>true</GenerateDocumentationFile>` to ship IntelliSense
+  docs with the NuGet package. With warnings-as-errors this also makes undocumented
+  public members (CS1591) build errors — good discipline for a published API; add
+  `<NoWarn>$(NoWarn);CS1591</NoWarn>` if you want the doc file without that rule.
 
 ## Post-setup checklist
 
@@ -67,3 +91,6 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 - [ ] `.csproj` package metadata (description, tags, URLs) filled in.
 - [ ] `CLAUDE.md` "Architecture" section written for your project.
 - [ ] Branch protection / required checks configured for `main` (CI, CodeQL).
+      If you require PRs or status checks on `main`, the release workflow's push of
+      the release commit will be blocked — give the release actor a bypass or add a
+      `RELEASE_TOKEN` secret (see the note in `.github/workflows/release.yml`).

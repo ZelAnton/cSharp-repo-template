@@ -23,11 +23,17 @@ jobs:
     permissions:
       contents: write
     steps:
+      # NOTE: the final "Commit, tag, push" step pushes the release commit straight
+      # to main. If you protect main with a rule that requires pull requests or
+      # status checks, that push is rejected and the release fails. Either grant the
+      # release actor a bypass (Settings -> Branches -> allow a GitHub App / Actions
+      # to bypass), or add a RELEASE_TOKEN secret (a PAT or App token that can bypass
+      # protection) — it is preferred over GITHUB_TOKEN below when present.
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -40,25 +46,32 @@ jobs:
           LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
           if [[ -n "$LATEST_TAG" ]]; then
             CURRENT="${LATEST_TAG#v}"
-            echo "Latest release tag: $LATEST_TAG → current=$CURRENT"
+            if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Could not parse current version from tag (got: '$CURRENT')"
+              exit 1
+            fi
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "${{ inputs.bump }}" in
+              major) NEW="$((MAJOR+1)).0.0" ;;
+              minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
+              patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+            esac
+            echo "Latest release tag: $LATEST_TAG (current=$CURRENT); ${{ inputs.bump }} bump -> $NEW"
           else
+            # First release: take the seed version straight from the .csproj <Version>
+            # so the published version matches what the repo declares, instead of an
+            # implicit 0.0.1 from bumping a synthetic 0.0.0. The bump input is ignored.
             CURRENT="0.0.0"
-            echo "No release tags found → current=0.0.0 (first release)"
+            NEW=$(grep -oP '(?<=<Version>)[^<]+' src/__ProjectName__/__ProjectName__.csproj | head -n1)
+            echo "No release tags found; seeding first release from .csproj <Version>=$NEW (bump input ignored)."
           fi
-          if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Could not parse current version (got: '$CURRENT')"
+          if [[ ! "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Computed version '$NEW' is not a valid MAJOR.MINOR.PATCH semver."
             exit 1
           fi
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          case "${{ inputs.bump }}" in
-            major) NEW="$((MAJOR+1)).0.0" ;;
-            minor) NEW="${MAJOR}.$((MINOR+1)).0" ;;
-            patch) NEW="${MAJOR}.${MINOR}.$((PATCH+1))" ;;
-          esac
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
           echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
-          echo "Bumping $CURRENT → $NEW"
 
       - name: Verify tag does not exist
         run: |

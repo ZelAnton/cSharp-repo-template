@@ -125,6 +125,8 @@ The release workflow ([.github/workflows/release.yml](.github/workflows/release.
 
 Publishing requires one repo secret: `NUGET_API_KEY` — a nuget.org API key with push permission for the `__ProjectName__` package.
 
+The first release seeds its version from the `.csproj` `<Version>` (so the inaugural tag matches what the repo declares); every release after that bumps from the latest `v*` tag per the workflow's `bump` input. The release workflow pushes the release commit directly to `main` — if `main` is protected with required PRs or status checks, that push is rejected. Give the release actor a bypass, or add a `RELEASE_TOKEN` secret (a PAT/App token that can bypass protection); the workflow prefers it over `GITHUB_TOKEN` when present.
+
 Self-signed author-signing is rejected by nuget.org (`NU3018`): the author signature's chain is validated against the Microsoft Trusted Root Program. If author-signing is ever introduced, the certificate must come from a public CA (DigiCert, Sectigo, SSL.com, …) — not from `New-SelfSignedCertificate`.
 
 ## Security scanning
