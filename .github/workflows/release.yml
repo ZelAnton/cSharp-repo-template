@@ -23,15 +23,40 @@ jobs:
     permissions:
       contents: write
     steps:
-      # NOTE: the final "Commit, tag, push" step pushes the release commit straight
-      # to main. If you protect main with a rule that requires pull requests or
-      # status checks, that push is rejected and the release fails. Either grant the
-      # release actor a bypass (Settings -> Branches -> allow a GitHub App / Actions
-      # to bypass), or add a RELEASE_TOKEN secret (a PAT or App token that can bypass
-      # protection) — it is preferred over GITHUB_TOKEN below when present.
+      # RELEASE ORDERING INVARIANT (rationale repeated at each relevant step):
+      # publishing to NuGet.org is the single IRREVERSIBLE step, so it is the pivot.
+      # Everything before it is cheap and reversible (build/test/pack, plus a LOCAL
+      # commit+tag that is not yet pushed); everything after it (push the commit+tag
+      # to main, create the GitHub Release) is reversible/recreatable and is made
+      # idempotent + retried. A failure before the pivot leaves no trace on the
+      # remote or registry — just re-run. A failure after the pivot is recoverable
+      # by re-run, EXCEPT once the tag is on main (see the Release step's note).
+      #
+      # The "Push the release commit + tag" step pushes straight to main. If you
+      # protect main with a rule that requires pull requests or status checks, that
+      # push is rejected. Either grant the release actor a bypass (Settings ->
+      # Branches -> allow a GitHub App / Actions to bypass), or add a RELEASE_TOKEN
+      # secret (a PAT or App token that can bypass protection) — it is preferred over
+      # GITHUB_TOKEN below when present.
       # Actions are pinned to a full commit SHA (supply-chain hardening); the
       # trailing comment records the human-readable version. Dependabot bumps the
       # SHA and updates the comment on its weekly run.
+      - name: Preflight — required secrets present before any external action
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Fail fast, before any irreversible publish or VCS push, if the publish
+          # credential is missing — otherwise a missing secret only surfaces at the
+          # publish step, after the cheap work has run. If you switch to NuGet
+          # Trusted Publishing (OIDC, see the publish step below), drop the
+          # NUGET_API_KEY check here and verify id-token availability instead.
+          if [[ -z "${NUGET_API_KEY:-}" ]]; then
+            echo "::error::NUGET_API_KEY secret is not set. Add it under Settings -> Secrets and variables -> Actions before releasing."
+            exit 1
+          fi
+          echo "Required secrets present."
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: main
@@ -83,7 +108,17 @@ jobs:
             exit 1
           fi
 
-      - name: Ensure previous tag exists
+      # Only git-cliff (next step) needs the previous tag, and only LOCALLY, to bound
+      # its commit range. So when the previous tag is missing (the synthetic v0.0.0 of
+      # a first release) create it locally and DO NOT push it to origin. Pushing it
+      # would be a remote write before the irreversible publish pivot AND would break
+      # first-release re-run safety: a pushed v0.0.0 matches the version glob in
+      # "Determine next version", so a re-run after a pre-publish failure would bump
+      # 0.0.0 -> 0.0.1 instead of re-seeding the intended version from the .csproj.
+      # Keeping it local means a re-run re-derives the same seed version. (Trade-off:
+      # the first release's "compare/v0.0.0...vX" changelog link 404s because v0.0.0
+      # is not on origin — harmless, as nothing precedes the first release.)
+      - name: Ensure previous tag exists (local only)
         env:
           PREV_TAG: v${{ steps.version.outputs.current }}
         run: |
@@ -93,9 +128,8 @@ jobs:
             exit 0
           fi
           ROOT=$(git rev-list --max-parents=0 HEAD | tail -n1)
-          echo "Previous tag $PREV_TAG does not exist; creating it at root commit $ROOT."
+          echo "Previous tag $PREV_TAG does not exist; creating it locally at root commit $ROOT (not pushed)."
           git tag "$PREV_TAG" "$ROOT"
-          git push origin "$PREV_TAG"
 
       - name: Install git-cliff
         uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2
@@ -269,7 +303,11 @@ jobs:
           path.write_text(text)
           PY
 
-      - name: Commit, tag, push
+      # Create the release commit and tag LOCALLY, but do NOT push yet: the push is
+      # a VCS write and must happen AFTER the irreversible NuGet publish (the pivot
+      # below). Keeping it local means a failure before/at publish leaves nothing on
+      # the remote, so a fresh re-run starts clean.
+      - name: Commit and tag the release (local only)
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -277,33 +315,81 @@ jobs:
           git add src/__ProjectName__/__ProjectName__.csproj CHANGELOG.md
           git commit -m "Release ${{ steps.version.outputs.tag }}"
           git tag "${{ steps.version.outputs.tag }}"
-          git push --atomic origin HEAD:refs/heads/main "${{ steps.version.outputs.tag }}"
 
-      # NuGet push happens AFTER the git commit/tag/push has succeeded. NuGet
-      # publishing is irreversible (a pushed version can only be unlisted), so
-      # publishing first risks an orphaned package with no matching tag/commit
-      # if the final git push is rejected (e.g. by branch protection — see the
-      # checkout note above). With this ordering the worst case is a tag with no
-      # package, which a re-run can finish; --skip-duplicate makes the push
-      # idempotent on re-run.
+      # === PIVOT: the single irreversible step ===
+      # NuGet publishing cannot be undone (a pushed version can only be unlisted,
+      # never re-pushed), so it is the pivot and every reversible action is ordered
+      # around it. It runs BEFORE the git push and the GitHub Release: if it fails,
+      # no tag/commit has reached the remote and no Release exists, so a re-run is
+      # safe and recomputes the SAME version (the latest tag has not moved).
+      # `--skip-duplicate` exits 0 when this exact version already exists on
+      # nuget.org (HTTP 409) — that is NuGet's own, version-scoped "already
+      # published == success" signal, so a re-run after a post-publish failure
+      # sails through instead of erroring. The loop retries only transient failures
+      # (network, registry blips).
       #
       # MORE SECURE ALTERNATIVE — NuGet Trusted Publishing (OIDC): instead of a
       # long-lived NUGET_API_KEY secret, mint a short-lived key per run. Add
-      # `id-token: write` to this job's permissions, configure a trusted
-      # publisher policy on nuget.org for this repo+workflow, then replace the
-      # step below with the `NuGet/login` action to obtain a temporary key.
-      # See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing
-      - name: Push to NuGet.org
-        run: dotnet nuget push "./artifacts/*.nupkg" --source "https://api.nuget.org/v3/index.json" --api-key ${{ secrets.NUGET_API_KEY }} --skip-duplicate
+      # `id-token: write` to this job's permissions, configure a trusted publisher
+      # policy on nuget.org for this repo+workflow, then replace the step below with
+      # the `NuGet/login` action to obtain a temporary key (and update the preflight
+      # step accordingly). See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing
+      - name: Push to NuGet.org (irreversible pivot)
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if dotnet nuget push "./artifacts/*.nupkg" \
+                 --source "https://api.nuget.org/v3/index.json" \
+                 --api-key "$NUGET_API_KEY" \
+                 --skip-duplicate; then
+              echo "NuGet push succeeded (attempt $attempt)."
+              exit 0
+            fi
+            echo "::warning::NuGet push attempt $attempt failed; retrying after backoff..."
+            sleep $((attempt * 15))
+          done
+          echo "::error::NuGet push failed after 3 attempts. Nothing was pushed to the remote and no Release was created — it is safe to re-run this workflow."
+          exit 1
 
-      - name: Create GitHub Release
+      # Reversible VCS write, AFTER the pivot. --atomic guarantees the branch and
+      # tag move together (or neither does), so we never advance main while losing
+      # the tag. If this is rejected (e.g. branch protection — see the checkout
+      # note), the package is already on nuget.org; re-running recomputes the SAME
+      # version (the tag is not yet on the remote) and --skip-duplicate makes the
+      # republish a no-op, so the re-run completes the release.
+      - name: Push the release commit + tag (atomic)
+        run: git push --atomic origin HEAD:refs/heads/main "${{ steps.version.outputs.tag }}"
+
+      # Final, recreatable step, made idempotent (edit the Release if it already
+      # exists, else create it) and retried. By now the package is published AND the
+      # tag is on main, so a blind re-run of the WHOLE workflow would compute the
+      # NEXT version and orphan this release — hence the failure message tells the
+      # operator to finish by hand rather than re-running.
+      - name: Create or update the GitHub Release (idempotent)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
           shopt -s nullglob
           assets=(./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS)
-          gh release create "${{ steps.version.outputs.tag }}" \
-            --title "${{ steps.version.outputs.tag }}" \
-            --notes-file release-notes.md \
-            "${assets[@]}"
+          for attempt in 1 2 3; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              if gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md \
+                 && gh release upload "$TAG" "${assets[@]}" --clobber; then
+                echo "Updated existing Release $TAG (attempt $attempt)."
+                exit 0
+              fi
+            else
+              if gh release create "$TAG" --title "$TAG" --notes-file release-notes.md "${assets[@]}"; then
+                echo "Created Release $TAG (attempt $attempt)."
+                exit 0
+              fi
+            fi
+            echo "::warning::GitHub Release step attempt $attempt failed; retrying after backoff..."
+            sleep $((attempt * 10))
+          done
+          echo "::error::Failed to create/update the GitHub Release after 3 attempts. The package is ALREADY on nuget.org and the tag is ALREADY on main. Do NOT re-run this workflow (a re-run computes the NEXT version and orphans this release). Finish by hand: if the Release does not exist yet, 'gh release create $TAG --title $TAG --notes-file release-notes.md ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS'; if it already exists (likely, since a partial attempt may have created it), 'gh release edit $TAG --notes-file release-notes.md && gh release upload $TAG ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS --clobber'."
+          exit 1
