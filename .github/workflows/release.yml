@@ -41,6 +41,21 @@ jobs:
       # Actions are pinned to a full commit SHA (supply-chain hardening); the
       # trailing comment records the human-readable version. Dependabot bumps the
       # SHA and updates the comment on its weekly run.
+
+      # We always release from main. workflow_dispatch still shows GitHub's
+      # "Use workflow from" ref picker (it cannot be hidden), so reject any
+      # dispatch from a non-main ref up front: otherwise that branch's copy of
+      # this workflow file would run — against main, which the checkout below
+      # hard-pins — producing a confusing mismatch. Fail fast before any work.
+      - name: Guard — release only from main
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "::error::Release must be dispatched from main (got: ${{ github.ref }}). Re-run with 'Use workflow from: main'."
+            exit 1
+          fi
+          echo "Dispatched from main."
+
       - name: Preflight — required secrets present before any external action
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
