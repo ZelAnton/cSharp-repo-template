@@ -11,7 +11,7 @@ have gone wrong in avoidable ways. **Read it before touching any files.**
 > incomplete. The whole point is that the *next* agent doesn't repeat what the
 > last one got wrong. See [Updating this guide](#updating-this-guide).
 
-## TL;DR — the five rules
+## TL;DR — the six rules
 
 1. **Read before you write.** Read `TEMPLATE.md`, this file, `AGENTS.md`, and
    `CLAUDE.md` *first*. Do not generate a single file based on an assumed layout.
@@ -25,6 +25,10 @@ have gone wrong in avoidable ways. **Read it before touching any files.**
    force by writing allow-rules yourself.
 5. **Verify, then clean.** `dotnet build` + `dotnet test` (+ `dotnet pack` if it
    publishes), then remove build artifacts before finishing.
+6. **Keep agent files local.** In the *new* repo, git-ignore and untrack the
+   agent-instruction files (`CLAUDE.md`, `AGENTS.md`, `.claude/`) so they stay on
+   disk for tools but never reach the remote. See
+   [Keep agent-instruction files local](#keep-agent-instruction-files-local-to-the-new-repo).
 
 ## What this template actually is
 
@@ -72,7 +76,10 @@ assumptions a past agent got wrong:
 4. Replace the placeholder `Greeter` type with the real API, delete the sample
    test, fill in the `CLAUDE.md` "Architecture" section, and work through the
    `TEMPLATE.md` post-setup checklist.
-5. Remove build artifacts (`bin/`, `obj/`, any `artifacts/`) before finishing.
+5. **Git-ignore and untrack the agent-instruction files** (`CLAUDE.md` /
+   `AGENTS.md` / `.claude/`) so they stay local and never reach the remote — see
+   [Keep agent-instruction files local](#keep-agent-instruction-files-local-to-the-new-repo).
+6. Remove build artifacts (`bin/`, `obj/`, any `artifacts/`) before finishing.
 
 If the user only asks to "initialize from the template" with a project name and
 nothing structurally unusual, **this is the whole job.** Resist the urge to
@@ -96,6 +103,9 @@ won't fit, so you adapt by hand — but still respect every convention above:
   output; add a matching `$(XxxProjectDir)` property in `Directory.Build.props`.
 - The release workflow should pack the **solution**, not a single hard-coded
   `.csproj`.
+- Still git-ignore and untrack `CLAUDE.md` / `AGENTS.md` / `.claude/` so they stay
+  local (see
+  [Keep agent-instruction files local](#keep-agent-instruction-files-local-to-the-new-repo)).
 - Still verify with build + test + pack, then clean artifacts.
 
 Whatever you change, update `AGENTS.md` / `CLAUDE.md` so they describe the layout
@@ -117,6 +127,79 @@ you actually produced.
   script activates it, or the user does. Leave it inert otherwise.
 - **VCS.** The repo is jj-colocated. Use `jj` commands; if you must use raw git,
   follow with `jj git import`.
+
+## Keep agent-instruction files local to the new repo
+
+This template *itself* tracks and ships its agent-instruction files — that is
+intentional and must not change here. But a repository **created from** this
+template should keep those files **out of its remote**: they are local guidance
+for whoever (human or agent) works in the clone, not something to publish or push
+to collaborators. So make them *untracked* in the new repo — present on disk,
+invisible to version control, never pushed. **The init script does not touch
+tracking; this is a by-hand step, done before the first push.**
+
+Which files: `CLAUDE.md`, `AGENTS.md`, and the `.claude/` directory (after the
+init script activates `settings.json`). Include any other agent-instruction files
+you add later — e.g. `.cursorrules`, `.github/copilot-instructions.md`. (Note
+`TEMPLATE.md` and `docs/AGENT-INIT-GUIDE.md` are template-only and the init script
+deletes them outright, so they need no handling.) Because this guide and
+`TEMPLATE.md` are deleted on init, the surviving copy of this recipe downstream is
+the "Agent instruction files are local-only in generated repos" section of
+`AGENTS.md` — that is the one to consult after init or on the by-hand path.
+
+Two facts make it more than a one-line `.gitignore` append:
+
+1. The files start out *tracked* (the template committed `CLAUDE.md`, `AGENTS.md`,
+   and `.claude/settings.json.template`; the init script renames the last to
+   `.claude/settings.json`). An ignore rule never untracks an already-tracked
+   file — you must also drop it from the index.
+2. The template's `.gitignore` **deliberately ships** `.claude/settings.json` —
+   `.claude/*` followed by negations (`!.claude/settings.json`,
+   `!.claude/settings.json.template`). So you must *either* append `.claude/`
+   **after** that block (a later directory-exclude overrides the negations) *or*
+   delete the two negation lines. A plain ignore placed *before* them won't hide
+   `.claude/settings.json`.
+
+Append the ignore patterns, then untrack (the working copy is kept), then commit:
+
+```bash
+printf '\n/CLAUDE.md\n/AGENTS.md\n.claude/\n' >> .gitignore
+git rm -r --cached CLAUDE.md AGENTS.md .claude
+git add .gitignore && git commit -m "Keep agent instructions local"   # commit the ignore rule *and* the removals together
+# jj-colocated: jj file untrack CLAUDE.md AGENTS.md .claude  (folds .gitignore + removals into the working copy; no separate commit)
+```
+
+`jj file untrack` only drops paths *already* matched by an ignore rule, so add the
+patterns first (jj honors `.gitignore` and `.git/info/exclude` alike).
+
+**Zero filename trace in the remote (optional).** `CLAUDE.md` and `AGENTS.md`
+aren't mentioned in `.gitignore`, so you can instead keep *them* in a local,
+never-pushed `.git/info/exclude` — then their names never appear in the pushed
+repo (the trade-off: it is per-clone, so a fresh clone re-tracks them and you
+re-apply):
+
+```bash
+printf '/CLAUDE.md\n/AGENTS.md\n' >> .git/info/exclude
+git rm --cached CLAUDE.md AGENTS.md
+```
+
+`.claude` can't use this route — the ship-negations outrank `.git/info/exclude`,
+so its rule still has to live in (or be removed from) the tracked `.gitignore` as
+above.
+
+Verify with `git status` (or `jj st`): the files must not appear as tracked or as
+new/untracked-to-be-added, and a `git push` must not carry them.
+
+**Caveat — files already in the remote's history.** The untrack-and-ignore above
+stops the files from going *forward* in new commits, which is what matters for
+day-to-day work. But if you created the repo via GitHub's **"Use this template"**
+(or any flow that already pushed an initial commit), the template's copies are
+*already* in that first commit on the remote — removing them now drops them from
+the tip but they survive in history. For a repo that has **never** contained
+them, create it by copying the template files into a fresh `git init` and untrack
+*before* the first commit; or, if you must start from a pushed "Use this template"
+repo and want a clean history, fold the removal into the initial commit (e.g.
+amend it) before the first push you control.
 
 ## Updating this guide
 

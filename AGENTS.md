@@ -7,6 +7,25 @@
 - Tests live in `tests/__ProjectName__.Tests`.
 - Keep the repository focused; do not introduce CLI, UI, hosting, logging, or dependency injection infrastructure unless explicitly requested.
 
+## Agent instruction files are local-only in generated repos
+
+> **Scope:** this section is for a repository **created from this template**, not
+> the template itself. In the template, `CLAUDE.md`, `AGENTS.md`, and `.claude/`
+> stay **tracked and pushed** — that is how the guidance ships. If you are reading
+> this in the template repo, leave them tracked and do nothing.
+
+In a generated repo, `CLAUDE.md`, `AGENTS.md`, and `.claude/` are local guidance for whoever (human or agent) works in the clone — not project source. Keep them **git-ignored and untracked** so they stay on disk for tooling but never reach the remote; each developer keeps their own. This is a **by-hand step — the init script does not do it** — done **before the first push**:
+
+```bash
+# Append last so `.claude/` overrides the earlier `!.claude/...` ship lines.
+printf '\n/CLAUDE.md\n/AGENTS.md\n.claude/\n' >> .gitignore
+git rm -r --cached CLAUDE.md AGENTS.md .claude
+git add .gitignore && git commit -m "Keep agent instructions local"   # commit the ignore rule *and* the removals together
+# jj-colocated: jj file untrack CLAUDE.md AGENTS.md .claude  (folds .gitignore + removals into the working copy; no separate commit)
+```
+
+`git rm --cached` keeps the files on disk; an ignore rule alone won't untrack already-committed files. `init` deletes `TEMPLATE.md` and `docs/AGENT-INIT-GUIDE.md`, so this section is the surviving copy of the recipe downstream — consult that guide while it exists for the precedence details, an optional zero-trace `.git/info/exclude` variant, and the caveat that a repo created via GitHub's *Use this template* already carries these files in its initial commit's history (untracking drops them from the tip only).
+
 ## Runtime
 
 - Use .NET (target framework `net10.0`).

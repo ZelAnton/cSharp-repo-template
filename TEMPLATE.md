@@ -38,6 +38,32 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 
 4. Replace the placeholder `Greeter` type in `src/...` with your real API and
    delete the sample test.
+5. **Keep the agent-instruction files local.** This template tracks and ships
+   `CLAUDE.md`, `AGENTS.md`, and `.claude/` on purpose — but a repo *created from*
+   it should keep them out of its remote: they are local guidance for tools, not
+   something to publish, so each developer keeps their own. The init script does
+   **not** do this — it is a by-hand step. Before your first push, git-ignore and
+   untrack them (the files stay on disk). They start out tracked and the
+   `.gitignore` here *deliberately* ships `.claude/settings.json`, so append the
+   ignore rules **after** that block, then drop the files from the index:
+
+   ```bash
+   printf '\n/CLAUDE.md\n/AGENTS.md\n.claude/\n' >> .gitignore
+   git rm -r --cached CLAUDE.md AGENTS.md .claude
+   git add .gitignore && git commit -m "Keep agent instructions local"   # commit the ignore rule *and* the removals
+   # jj-colocated: jj file untrack CLAUDE.md AGENTS.md .claude  (folds .gitignore + removals in; no separate commit)
+   ```
+
+   Appending `.claude/` last makes it win over the earlier `!.claude/...` ship
+   lines. The names then appear in the pushed `.gitignore` (contents never leave
+   your machine); for zero filename trace, and the full jj-colocated steps, see
+   [docs/AGENT-INIT-GUIDE.md](docs/AGENT-INIT-GUIDE.md). One caveat: a repo created
+   via **"Use this template"** already carries these files in its initial commit on
+   the remote, so untracking keeps them out of *later* commits only; for a clean
+   history, copy the template into a fresh `git init` and untrack before the first
+   commit. Because `init` deletes this file and the guide, the surviving copy of
+   this recipe downstream is the "Agent instruction files are local-only in
+   generated repos" section of [AGENTS.md](AGENTS.md).
 
 ## Placeholder tokens
 
@@ -112,6 +138,9 @@ project.
 
 ## Post-setup checklist
 
+- [ ] Agent-instruction files (`CLAUDE.md`, `AGENTS.md`, `.claude/`) git-ignored
+      and untracked so they stay local and never reach the remote — by hand,
+      before the first push (step 5 above); verify with `git status` / `jj st`.
 - [ ] `NUGET_API_KEY` repo secret added (only if publishing to NuGet), or
       NuGet Trusted Publishing (OIDC) configured — see `release.yml`.
 - [ ] LICENSE author/year and license choice reviewed.
