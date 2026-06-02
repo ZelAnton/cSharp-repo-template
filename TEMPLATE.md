@@ -148,7 +148,8 @@ project.
 - [ ] `SECURITY.md` reporting contact reviewed; `.github/CODEOWNERS` enabled if wanted.
 - [ ] GitHub **Settings → Security → Private vulnerability reporting** enabled (for `SECURITY.md`).
 - [ ] `CLAUDE.md` "Architecture" section written for your project.
-- [ ] Branch protection / required checks configured for `main` (CI, CodeQL).
-      If you require PRs or status checks on `main`, the release workflow's push of
-      the release commit will be blocked — give the release actor a bypass or add a
+- [ ] Branch protection for `main` configured — require pull requests (plus CI / CodeQL
+      status checks). The agent docs (`CLAUDE.md` / `AGENTS.md`) already assume a
+      feature-branch + PR flow into `main`. Requiring PRs blocks the release workflow's
+      direct push of the release commit — give the release actor a bypass or add a
       `RELEASE_TOKEN` secret (see the note in `.github/workflows/release.yml`).

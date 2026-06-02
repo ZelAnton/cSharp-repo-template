@@ -158,14 +158,15 @@ The repo uses [jujutsu (`jj`)](https://jj-vcs.github.io/jj/) (colocated with git
 	- Current change finished? → `jj new -m "..."` (descendant).
 	- Current change still in progress? → `jj new @- -m "..."` (parallel sibling, so you can return to the original later).
 - **Sync on the user's trigger.** When the user says `pull` (or `push`/`sync`), run the full handshake:
-	1. `jj git fetch` first — picks up any remote movement (CI release commits, etc.).
-	2. Rebase if `main@origin` advanced: `jj rebase -r @- -d main@origin`.
-	3. `jj bookmark set main -r <rev>` then `jj git push --bookmark main`.
+	1. `jj git fetch` first — picks up any remote movement (merged PRs, CI release commits, etc.).
+	2. Rebase if `main@origin` advanced: `jj rebase -r @- -d main@origin` (or `jj rebase -d main@origin` for a stack).
+	3. Put the work on a **feature bookmark**, not `main`: `jj bookmark create <topic> -r @` the first time (then `jj bookmark move <topic> --to @` as it grows), and push only it: `jj git push --allow-new -b <topic>`.
+	4. Open a pull request into `main` (`gh pr create --base main --head <topic> --fill`, or via the GitHub UI). `main` advances only when that PR merges; afterwards `jj git fetch` brings the merge down and you `jj bookmark delete <topic>`.
 
-	Never push without an explicit signal from the user.
+	Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is *not* protected, the old flow still works — `jj bookmark move main --to @` then `jj git push -b main`. Once branch protection requires PRs, a direct push to `main` is rejected for everyone except the release bot (its `RELEASE_TOKEN`/bypass).
 - **Undoing dropped work.** When the user decides to abandon something already done, reach for `jj`'s safety net rather than hand-cleanup:
 	- `jj undo` (alias of `jj op undo`) reverses the last operation — describe, edit, squash, rebase, abandon, push, all of it. Repeatable.
 	- `jj abandon <rev>` drops a specific change entirely; descendants auto-rebase.
 	- `jj restore` discards working-copy edits back to the parent's tree.
 	- `jj op log` is the full reflog if you need to go further back via `jj op restore <op-id>`.
-- **No new bookmarks** unless the user explicitly asks. Work lives on `main`; that is the publish target.
+- **Feature bookmarks are the unit of work** — one per PR, short kebab-case topic name. Don't advance `main` locally to publish; `main` moves only via merged PRs and the release workflow's tagged commit. (Previously work lived directly on `main`; branch protection requiring PRs makes direct push the exception — see the fallback above.)

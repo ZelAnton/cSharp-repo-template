@@ -251,12 +251,12 @@ If the user asks for something unrelated to the in-progress change:
 ### Pushing to remote
 
 The user signals "synchronise with remote" with a short trigger word (typically `pull` or `push`). On that signal, run the full sync:
-1. `jj git fetch` — pull down any remote-side movement (e.g. CI release commits or other contributors' pushes) **before** doing anything else.
-2. If `main@origin` has moved past the local change, rebase: `jj rebase -r @- -d main@origin`.
-3. Move the `main` bookmark to the completed change: `jj bookmark set main -r <rev>`.
-4. Push: `jj git push --bookmark main`.
+1. `jj git fetch` — pull down remote movement (merged PRs, CI release commits, other contributors) **before** doing anything else.
+2. If `main@origin` has moved past the local change, rebase onto it: `jj rebase -r @- -d main@origin` (or `jj rebase -d main@origin` for a stack).
+3. Put the work on a **feature bookmark — never advance `main` locally to publish.** First push: `jj bookmark create <topic> -r @` then `jj git push --allow-new -b <topic>`. Later pushes: `jj bookmark move <topic> --to @` then `jj git push -b <topic>`.
+4. Open / update a pull request into `main` (`gh pr create --base main --head <topic> --fill`). `main` advances only when the PR merges; afterwards `jj git fetch` and `jj bookmark delete <topic>`.
 
-Never push without an explicit signal from the user.
+Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is unprotected the old single-step flow still works — `jj bookmark move main --to @` then `jj git push -b main`; once PRs are required this is rejected for everyone except the release bot (`RELEASE_TOKEN`/bypass).
 
 ### Undoing work
 
@@ -271,7 +271,7 @@ Never hide a deliberate undo: if the user asks to "undo the last commit/change",
 
 ### Bookmarks
 
-Work happens on `main`. **Do not create new bookmarks unless the user explicitly asks for one** (e.g. for a feature-branch / PR workflow). The default flow is push-to-main.
+Work is published through a **feature bookmark per PR** (short kebab-case topic name), merged into `main` via pull request — this keeps the flow compatible with branch protection on `main`. Create the bookmark when you're ready to push for review; `main` is never advanced locally to publish (it moves only via merged PRs and the release workflow's tagged commit). Where `main` is unprotected, a direct push to `main` stays a valid shortcut — see "Pushing to remote".
 
 ### Safety
 
