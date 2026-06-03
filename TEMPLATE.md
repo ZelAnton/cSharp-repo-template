@@ -151,5 +151,7 @@ project.
 - [ ] Branch protection for `main` configured — require pull requests (plus CI / CodeQL
       status checks). The agent docs (`CLAUDE.md` / `AGENTS.md`) already assume a
       feature-branch + PR flow into `main`. Requiring PRs blocks the release workflow's
-      direct push of the release commit — give the release actor a bypass or add a
-      `RELEASE_TOKEN` secret (see the note in `.github/workflows/release.yml`).
+      direct push of the release commit. The workflow pushes as a GitHub App when
+      configured — add repo variable `RELEASE_APP_ID` + secret `RELEASE_APP_PRIVATE_KEY`,
+      install the App, and add it to the ruleset's bypass list (recipe:
+      `release-token-bypass.md`).

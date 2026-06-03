@@ -127,7 +127,7 @@ The release workflow ([.github/workflows/release.yml](.github/workflows/release.
 
 Publishing requires one repo secret: `NUGET_API_KEY` — a nuget.org API key with push permission for the `__ProjectName__` package.
 
-The first release seeds its version from the `.csproj` `<Version>` (so the inaugural tag matches what the repo declares); every release after that bumps from the latest `v*` tag per the workflow's `bump` input. The release workflow pushes the release commit directly to `main` — if `main` is protected with required PRs or status checks, that push is rejected. Give the release actor a bypass, or add a `RELEASE_TOKEN` secret (a PAT/App token that can bypass protection); the workflow prefers it over `GITHUB_TOKEN` when present.
+The first release seeds its version from the `.csproj` `<Version>` (so the inaugural tag matches what the repo declares); every release after that bumps from the latest `v*` tag per the workflow's `bump` input. The release workflow pushes the release commit directly to `main` — if `main` is protected with required PRs or status checks, that push is rejected unless the pusher can bypass the rule. The workflow mints a short-lived GitHub App token (repo variable `RELEASE_APP_ID` + secret `RELEASE_APP_PRIVATE_KEY`) and pushes as that App, which you add to the ruleset's bypass list; it falls back to `GITHUB_TOKEN` when the App isn't configured. Full recipe: `release-token-bypass.md`.
 
 Self-signed author-signing is rejected by nuget.org (`NU3018`): the author signature's chain is validated against the Microsoft Trusted Root Program. If author-signing is ever introduced, the certificate must come from a public CA (DigiCert, Sectigo, SSL.com, …) — not from `New-SelfSignedCertificate`.
 
@@ -163,7 +163,7 @@ The repo uses [jujutsu (`jj`)](https://jj-vcs.github.io/jj/) (colocated with git
 	3. Put the work on a **feature bookmark**, not `main`: `jj bookmark create <topic> -r @` the first time (then `jj bookmark move <topic> --to @` as it grows), and push only it: `jj git push --allow-new -b <topic>`.
 	4. Open a pull request into `main` (`gh pr create --base main --head <topic> --fill`, or via the GitHub UI). `main` advances only when that PR merges; afterwards `jj git fetch` brings the merge down and you `jj bookmark delete <topic>`.
 
-	Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is *not* protected, the old flow still works — `jj bookmark move main --to @` then `jj git push -b main`. Once branch protection requires PRs, a direct push to `main` is rejected for everyone except the release bot (its `RELEASE_TOKEN`/bypass).
+	Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is *not* protected, the old flow still works — `jj bookmark move main --to @` then `jj git push -b main`. Once branch protection requires PRs, a direct push to `main` is rejected for everyone except the release workflow's GitHub App, which sits in the ruleset's bypass list (`RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY`; see `release-token-bypass.md`).
 - **Undoing dropped work.** When the user decides to abandon something already done, reach for `jj`'s safety net rather than hand-cleanup:
 	- `jj undo` (alias of `jj op undo`) reverses the last operation — describe, edit, squash, rebase, abandon, push, all of it. Repeatable.
 	- `jj abandon <rev>` drops a specific change entirely; descendants auto-rebase.
