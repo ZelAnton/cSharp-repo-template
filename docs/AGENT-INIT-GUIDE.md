@@ -36,8 +36,9 @@ Confirm these facts by reading, not by assuming — they are exactly the
 assumptions a past agent got wrong:
 
 - It is a **token template**, not a ready project. Placeholder tokens
-  (`__ProjectName__`, `__Author__`, `__GitHubOwner__`, `__Description__`,
-  `__Year__`) appear in file *contents* and in file/folder *names*. They are
+  (`__ProjectName__`, `__Author__`, `__AuthorEmail__`, `__GitHubOwner__`,
+  `__Description__`, `__Year__`) appear in file *contents* and in file/folder
+  *names*. They are
   substituted by `scripts/init.ps1`.
 - It is **single-project** by default: one library in `src/__ProjectName__`, one
   test project in `tests/__ProjectName__.Tests`.

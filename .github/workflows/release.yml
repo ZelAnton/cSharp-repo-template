@@ -347,8 +347,8 @@ jobs:
       - name: Commit and tag the release (local only)
         run: |
           set -euo pipefail
-          git config user.name "Anton Zhelezniakou"
-          git config user.email "github@zelanton.net"
+          git config user.name "__Author__"
+          git config user.email "__AuthorEmail__"
           git add src/__ProjectName__/__ProjectName__.csproj CHANGELOG.md
           git commit -m "Release ${{ steps.version.outputs.tag }}"
           git tag "${{ steps.version.outputs.tag }}"
