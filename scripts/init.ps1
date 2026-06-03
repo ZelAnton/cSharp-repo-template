@@ -90,6 +90,11 @@ foreach ($key in $replacements.Keys) {
 }
 $xmlFileExtensions = @('.csproj', '.props', '.targets', '.slnx', '.config')
 
+# Binary files carry no tokens; reading/rewriting them as text would corrupt them.
+# The template ships none, but a downstream user may add e.g. a strong-name key or
+# a NuGet package icon before running init, so skip them by extension.
+$binaryExtensions = @('.snk', '.pfx', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
+
 $excludedDirs = @('.git', '.jj', 'bin', 'obj')
 
 function Test-Excluded([string]$fullPath) {
@@ -111,6 +116,7 @@ $files = Get-ChildItem -Path $repoRoot -File -Recurse | Where-Object {
 }
 $contentChanged = 0
 foreach ($file in $files) {
+    if ($binaryExtensions -contains $file.Extension) { continue }
     $text = [System.IO.File]::ReadAllText($file.FullName)
     $new = $text
     $map = if ($xmlFileExtensions -contains $file.Extension) { $xmlReplacements } else { $replacements }

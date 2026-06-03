@@ -111,6 +111,13 @@ while IFS= read -r -d '' file; do
   case "$file" in
     "$self"|"$sibling_ps1") continue ;;
   esac
+  # Skip binary files: they carry no tokens, and reading them through a shell
+  # command substitution strips NUL bytes, which would corrupt the file on rewrite.
+  # The template ships none, but a downstream user may add e.g. a strong-name key
+  # or a NuGet package icon before running init.
+  case "$file" in
+    *.snk|*.pfx|*.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip) continue ;;
+  esac
   case "$file" in
     *.csproj|*.props|*.targets|*.slnx|*.config)
       p=$project_x; a=$author_x; ae=$author_email_x; o=$owner_x; d=$desc_x; y=$year_x ;;
