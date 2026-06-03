@@ -16,7 +16,13 @@ dotnet add package __ProjectName__
 
 ## Usage
 
-TODO: document the public API with usage examples.
+```csharp
+using __ProjectName__;
+
+var greeting = Greeter.Greet("World"); // "Hello, World!"
+```
+
+TODO: replace the placeholder API above and document the real public surface.
 
 ## Verifying the package
 

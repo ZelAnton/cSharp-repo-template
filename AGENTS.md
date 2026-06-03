@@ -235,17 +235,22 @@ This repository uses [jujutsu (`jj`)](https://jj-vcs.github.io/jj/) for version 
 - For larger work, fold subsequent small edits into the current change without asking the user — keep extending the same change rather than starting a new one for each follow-up.
 - If the scope of the current change shifts mid-work, refresh the description with another `jj describe -m "..."`. The description must always reflect what's actually being done.
 
+- **Per-prompt evaluation (mandatory).** Before any edits, run `jj st` and
+  classify the incoming prompt against the current change description:
+
+	| Signal in prompt | Category | Action |
+	|---|---|---|
+	| Same topic, refinement, follow-up of in-progress work | **Continuation** | Just work. jj auto-folds edits into the current change. |
+	| Same change but goal has been refined or expanded | **Scope shift** | `jj describe -m "<refined summary>"`. **Don't** start a new change. |
+	| Orthogonal topic, different area, "теперь сделай X" | **New work** | If current change is finished → `jj new -m "<summary>"` (descendant). If still in progress → `jj new @- -m "..."` (parallel sibling). |
+
+	Reliable signals: word changes like "теперь" / "now" / "next" / "также сделай" / "and also" usually mean **new work** or **scope shift**. Imperative follow-ups inside the same scope ("исправь это", "fix this", "продолжи") mean **continuation**. When in doubt, ask the user.
+
 ### Starting unrelated work
 
-If the user asks for something unrelated to the in-progress change:
-- **Current change is complete** → propose a new change descended from it:
-	```
-	jj new -m "Description of the new task"
-	```
-- **Current change still needs more work** → propose a parallel change off the same parent so the user can come back to the current one later:
-	```
-	jj new @- -m "Description of the unrelated task"
-	```
+When the per-prompt evaluation above lands on **New work**, branch rather than mixing topics into the current change:
+- **Current change is complete** → `jj new -m "Description of the new task"` (a descendant).
+- **Current change still needs more work** → `jj new @- -m "Description of the unrelated task"` (a parallel change off the same parent, so the user can return to the current one later).
 - Do not silently mix the two — every change must stay coherent.
 
 ### Pushing to remote

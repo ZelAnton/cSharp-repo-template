@@ -71,12 +71,7 @@ if not needed.
 
 ## MSBuild path properties
 
-`Directory.Build.props` defines two canonical path properties that every project in the repo inherits:
-
-- `$(RepoRoot)` — absolute path to the repository root (trailing separator included). Derived from `$(MSBuildThisFileDirectory)` inside `Directory.Build.props`, so it is always the directory that contains that file.
-- `$(MainProjectDir)` — absolute path to `src/__ProjectName__/` (the main library project directory).
-
-Use these properties wherever a `.csproj`, `.props`, or `.targets` file must reference something outside its own directory — never write `..\..\` or `$(MSBuildThisFileDirectory)..\` directly. If a new project is added that others reference by path, add a matching `$(XxxProjectDir)` property to `Directory.Build.props`.
+See [AGENTS.md](AGENTS.md) → "MSBuild Path Properties" for `$(RepoRoot)` / `$(MainProjectDir)` and the no-relative-paths rule.
 
 ## Changelog
 
