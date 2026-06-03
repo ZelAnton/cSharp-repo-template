@@ -7,7 +7,7 @@
     Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
     __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder names, then
     removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md, and,
-    unless -KeepScript, this script itself).
+    unless -KeepScript, both initializers — this script and init.sh).
 
     Run it once, right after creating a repository from the template:
 
@@ -102,9 +102,12 @@ function Test-Excluded([string]$fullPath) {
 
 Write-Host "==> Initializing template as '$ProjectName'" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents (this script is left untouched).
+# 1) Replace tokens in file contents. Both initializers are skipped: they carry
+#    the placeholder search-keys as literals, so substituting them would corrupt
+#    the sibling script (which -KeepScript leaves on disk).
+$siblingShPath = Join-Path $PSScriptRoot 'init.sh'
 $files = Get-ChildItem -Path $repoRoot -File -Recurse | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath
+    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingShPath
 }
 $contentChanged = 0
 foreach ($file in $files) {
