@@ -52,8 +52,14 @@ jobs:
       - name: Guard — release only from main
         run: |
           set -euo pipefail
-          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
-            echo "::error::Release must be dispatched from main (got: ${{ github.ref }}). Re-run with 'Use workflow from: main'."
+          # Read the dispatch ref from the built-in $GITHUB_REF env var rather than
+          # interpolating the github.ref expression into the script text: a branch
+          # name with shell metacharacters (git allows e.g. ';' '|' backticks in ref
+          # names) would otherwise inject into this run block. The standard Actions
+          # script-injection guard. (Note: an expression placed even in a comment
+          # here would still be substituted, so we avoid writing one.)
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Release must be dispatched from main (got: $GITHUB_REF). Re-run with 'Use workflow from: main'."
             exit 1
           fi
           echo "Dispatched from main."
