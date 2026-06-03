@@ -14,21 +14,30 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 
 1. Create a new repository from this one (GitHub: **Use this template**), or copy
    the files into a fresh repo.
-2. Run the init script once to stamp your project name in:
+2. Run the init script once to stamp your project name in. Use whichever
+   matches your shell — both do the same thing:
 
    ```pwsh
    pwsh ./scripts/init.ps1 -ProjectName Acme.Widgets -Author "Jane Doe" -GitHubOwner acme -Description "Widget toolkit"
    ```
 
-   `-ProjectName` is required; the rest are optional and fall back to sensible
-   defaults (`git config user.name`, `your-org`, a TODO description, the current
-   year). The script:
-   - replaces the placeholder tokens in every file's contents;
+   ```bash
+   bash ./scripts/init.sh --project-name Acme.Widgets --author "Jane Doe" --github-owner acme --description "Widget toolkit"
+   ```
+
+   `-ProjectName` / `--project-name` is required; the rest are optional and fall
+   back to sensible defaults (`git config user.name`, `git config user.email`,
+   `your-org`, a TODO description, the current year). The script:
+   - replaces the placeholder tokens in every file's contents (XML-escaping the
+     values written into `.csproj`/`.slnx`/`.props`/`.targets`/`.config` files);
    - renames the token-named files and folders (`src/__ProjectName__`,
      `tests/__ProjectName__.Tests`, the `.csproj`/`.slnx`/`.sln.DotSettings`);
    - activates `.claude/settings.json` from its shipped `.template` form
      (sane shared permissions for `dotnet` commands);
-   - deletes this `TEMPLATE.md` and (unless `-KeepScript`) itself.
+   - deletes this `TEMPLATE.md` and the `docs/AGENT-INIT-GUIDE.md`, and (unless
+     `-KeepScript` / `--keep-script`) removes **both** initializers — it deletes
+     itself *and* its sibling, so a generated repo ships neither `init.ps1` nor
+     `init.sh`.
 3. Verify:
 
    ```pwsh

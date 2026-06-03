@@ -153,6 +153,13 @@ foreach ($path in $templateOnly) {
     }
 }
 
+# Drop docs/ if it's now empty (it usually isn't — linux-testing.md also lives here).
+$docsDir = Join-Path $repoRoot 'docs'
+if ((Test-Path -LiteralPath $docsDir) -and -not (Get-ChildItem -LiteralPath $docsDir -Force)) {
+    Remove-Item -LiteralPath $docsDir -Force
+    Write-Host "    Removed docs" -ForegroundColor DarkGray
+}
+
 Write-Host ""
 Write-Host "Done. Next steps:" -ForegroundColor Green
 Write-Host "  1. dotnet build $ProjectName.slnx"
@@ -162,6 +169,11 @@ Write-Host "  4. NuGet publishing: add the NUGET_API_KEY repo secret, or delete"
 Write-Host "     .github/workflows/release.yml and the packaging properties in the .csproj."
 Write-Host "  5. Commit the initialized project."
 
+# Remove both initializers unless asked to keep them.
 if (-not $KeepScript) {
+    $siblingSh = Join-Path $PSScriptRoot 'init.sh'
+    if (Test-Path -LiteralPath $siblingSh) {
+        Remove-Item -LiteralPath $siblingSh -Force
+    }
     Remove-Item -LiteralPath $selfPath -Force
 }
