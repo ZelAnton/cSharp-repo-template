@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.yamllint.yml` config (tuned for GitHub Actions) and a CI `yaml-lint` job that lints workflow YAML.
 
 ### Changed
-- Release workflow pushes the git commit/tag **before** publishing to NuGet, so a blocked git push can't leave an orphaned package on the registry.
+- Release workflow makes the NuGet publish the single irreversible pivot: build, test, pack and a **local** commit/tag run before it, and the commit/tag are pushed to `main` (plus the GitHub Release created) only **after** a successful publish — so any failure up to and including the publish leaves no remote or registry trace and is safe to re-run.
 - All GitHub Actions are pinned to a commit SHA (with a version comment) instead of a moving tag; Dependabot now groups action bumps into a single weekly PR.
 
 ### Fixed
