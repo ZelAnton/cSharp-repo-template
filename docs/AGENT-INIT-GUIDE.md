@@ -11,21 +11,25 @@ have gone wrong in avoidable ways. **Read it before touching any files.**
 > incomplete. The whole point is that the *next* agent doesn't repeat what the
 > last one got wrong. See [Updating this guide](#updating-this-guide).
 
-## TL;DR — the six rules
+## TL;DR — the seven rules
 
 1. **Read before you write.** Read `TEMPLATE.md`, this file, `AGENTS.md`, and
    `CLAUDE.md` *first*. Do not generate a single file based on an assumed layout.
-2. **Prefer the init script over hand-rolling.** `scripts/init.ps1` is the
+2. **Check the toolchain first.** Run `scripts/check-env.ps1` (or
+   `scripts/check-env.sh`). If it reports a missing tool, STOP and offer the user
+   the install commands it prints — don't run init against an environment that
+   can't build or test.
+3. **Prefer the init script over hand-rolling.** `scripts/init.ps1` is the
    supported path for a standard single-project init. Run it; don't recreate its
    work by hand.
-3. **Match the shell to the tool.** On Windows the Bash tool is POSIX (git bash);
+4. **Match the shell to the tool.** On Windows the Bash tool is POSIX (git bash);
    PowerShell cmdlets fail there. Use the PowerShell tool for cmdlets.
-4. **Don't fight the permission model.** `.claude/settings.json` ships as a
+5. **Don't fight the permission model.** `.claude/settings.json` ships as a
    `.template`; activating it is the script's / user's job, not something you
    force by writing allow-rules yourself.
-5. **Verify, then clean.** `dotnet build` + `dotnet test` (+ `dotnet pack` if it
+6. **Verify, then clean.** `dotnet build` + `dotnet test` (+ `dotnet pack` if it
    publishes), then remove build artifacts before finishing.
-6. **Keep agent files local.** In the *new* repo, git-ignore and untrack the
+7. **Keep agent files local.** In the *new* repo, git-ignore and untrack the
    agent-instruction files (`CLAUDE.md`, `AGENTS.md`, `.claude/`) so they stay on
    disk for tools but never reach the remote. See
    [Keep agent-instruction files local](#keep-agent-instruction-files-local-to-the-new-repo).
@@ -58,7 +62,10 @@ assumptions a past agent got wrong:
 ## The happy path (standard single-project init)
 
 1. **Read** `TEMPLATE.md` and this guide. Skim `AGENTS.md` / `CLAUDE.md`.
-2. **Run the init script** with the values the user gave you:
+2. **Check the environment.** Run `scripts/check-env.ps1` (or `check-env.sh`). If
+   it flags a missing tool, stop and offer the user the install commands it prints
+   before continuing — don't init against an environment that can't build or test.
+3. **Run the init script** with the values the user gave you:
 
    ```pwsh
    pwsh ./scripts/init.ps1 -ProjectName Acme.Widgets -Author "Jane Doe" -GitHubOwner acme -Description "Widget toolkit"
@@ -68,19 +75,19 @@ assumptions a past agent got wrong:
    script substitutes tokens, renames files/folders, activates
    `.claude/settings.json` from its `.template`, and deletes `TEMPLATE.md` (and
    itself unless `-KeepScript`).
-3. **Verify**:
+4. **Verify**:
 
    ```pwsh
    dotnet build Acme.Widgets.slnx
    dotnet test  Acme.Widgets.slnx
    ```
-4. Replace the placeholder `Greeter` type with the real API, delete the sample
+5. Replace the placeholder `Greeter` type with the real API, delete the sample
    test, fill in the `CLAUDE.md` "Architecture" section, and work through the
    `TEMPLATE.md` post-setup checklist.
-5. **Git-ignore and untrack the agent-instruction files** (`CLAUDE.md` /
+6. **Git-ignore and untrack the agent-instruction files** (`CLAUDE.md` /
    `AGENTS.md` / `.claude/`) so they stay local and never reach the remote — see
    [Keep agent-instruction files local](#keep-agent-instruction-files-local-to-the-new-repo).
-6. Remove build artifacts (`bin/`, `obj/`, any `artifacts/`) before finishing.
+7. Remove build artifacts (`bin/`, `obj/`, any `artifacts/`) before finishing.
 
 If the user only asks to "initialize from the template" with a project name and
 nothing structurally unusual, **this is the whole job.** Resist the urge to

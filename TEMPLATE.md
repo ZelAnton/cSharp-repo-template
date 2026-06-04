@@ -14,7 +14,23 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 
 1. Create a new repository from this one (GitHub: **Use this template**), or copy
    the files into a fresh repo.
-2. Run the init script once to stamp your project name in. Use whichever
+2. **Check your environment is ready.** Before initializing, confirm this machine
+   has the toolchain to build and test a C# project. Use whichever matches your
+   shell — both do the same thing:
+
+   ```pwsh
+   pwsh ./scripts/check-env.ps1
+   ```
+
+   ```bash
+   bash ./scripts/check-env.sh
+   ```
+
+   It checks for the .NET SDK (the major band pinned in `global.json`). If
+   anything required is missing it lists the install commands for your OS and
+   exits non-zero — install what it names, then re-run it. **Don't run init until
+   it reports the environment is ready.**
+3. Run the init script once to stamp your project name in. Use whichever
    matches your shell — both do the same thing:
 
    ```pwsh
@@ -38,16 +54,16 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
      `-KeepScript` / `--keep-script`) removes **both** initializers — it deletes
      itself *and* its sibling, so a generated repo ships neither `init.ps1` nor
      `init.sh`.
-3. Verify:
+4. Verify:
 
    ```pwsh
    dotnet build Acme.Widgets.slnx
    dotnet test  Acme.Widgets.slnx
    ```
 
-4. Replace the placeholder `Greeter` type in `src/...` with your real API and
+5. Replace the placeholder `Greeter` type in `src/...` with your real API and
    delete the sample test.
-5. **Keep the agent-instruction files local.** This template tracks and ships
+6. **Keep the agent-instruction files local.** This template tracks and ships
    `CLAUDE.md`, `AGENTS.md`, and `.claude/` on purpose — but a repo *created from*
    it should keep them out of its remote: they are local guidance for tools, not
    something to publish, so each developer keeps their own. The init script does
@@ -150,7 +166,7 @@ project.
 
 - [ ] Agent-instruction files (`CLAUDE.md`, `AGENTS.md`, `.claude/`) git-ignored
       and untracked so they stay local and never reach the remote — by hand,
-      before the first push (step 5 above); verify with `git status` / `jj st`.
+      before the first push (step 6 above); verify with `git status` / `jj st`.
 - [ ] `NUGET_API_KEY` repo secret added (only if publishing to NuGet), or
       NuGet Trusted Publishing (OIDC) configured — see `release.yml`.
 - [ ] LICENSE author/year and license choice reviewed.
