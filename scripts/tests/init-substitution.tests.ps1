@@ -9,6 +9,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "csharp-template-init-$([Guid]::NewGuid().ToString('N'))"
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
+$pwshCommand = @(Get-Command pwsh -CommandType Application -ErrorAction Stop)[0]
 
 function Assert-Equal([string]$expected, [string]$actual, [string]$message) {
     if ($actual -cne $expected) {
@@ -53,6 +54,28 @@ function Invoke-Native(
     return [pscustomobject]@{
         ExitCode = $exitCode
         Output = $outputText
+    }
+}
+
+function Invoke-WithEnvironment(
+    [string]$filePath,
+    [string[]]$arguments,
+    [string]$workingDirectory,
+    [hashtable]$environment
+) {
+    $previous = @{}
+    foreach ($name in $environment.Keys) {
+        $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable($name, [string]$environment[$name], 'Process')
+    }
+
+    try {
+        return Invoke-Native $filePath $arguments $workingDirectory
+    }
+    finally {
+        foreach ($name in $environment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')
+        }
     }
 }
 
@@ -336,6 +359,148 @@ function Test-NumericLookingBase64 {
     Test-GeneratedSyntax $bashRoot
 }
 
+function Assert-PowerShellIdentity(
+    [string]$root,
+    [string]$projectName,
+    [string]$author,
+    [string]$authorEmail
+) {
+    $projectXml = [xml][IO.File]::ReadAllText((Join-Path $root "src/$projectName/$projectName.csproj"))
+    Assert-Equal $author $projectXml.SelectSingleNode('//Authors').InnerText 'PowerShell initializer selected the wrong author.'
+    Assert-WorkflowIdentitySerialization $root $author $authorEmail
+}
+
+function Test-PowerShellGitFallbacks {
+    $emptyPath = Join-Path $tempRoot 'empty-path'
+    [IO.Directory]::CreateDirectory($emptyPath) | Out-Null
+
+    $withoutGitRoot = Join-Path $tempRoot 'pwsh-without-git'
+    $withoutGitHome = Join-Path $withoutGitRoot '.isolated-home'
+    Copy-Template $withoutGitRoot
+    [IO.Directory]::CreateDirectory($withoutGitHome) | Out-Null
+    $withoutGitEnvironment = @{
+        PATH = $emptyPath
+        HOME = $withoutGitHome
+        USERPROFILE = $withoutGitHome
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_GLOBAL = (Join-Path $withoutGitHome '.gitconfig')
+    }
+    $null = Invoke-WithEnvironment $pwshCommand.Source @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', 'Acme.NoGit',
+        '-GitHubOwner', 'safe-owner',
+        '-Description', 'No Git fallback regression',
+        '-Year', '2042',
+        '-KeepScript'
+    ) $withoutGitRoot $withoutGitEnvironment
+    Assert-PowerShellIdentity $withoutGitRoot 'Acme.NoGit' 'Your Name' 'you@example.com'
+
+    $null = Get-Command git -CommandType Application -ErrorAction Stop
+    $withGitRoot = Join-Path $tempRoot 'pwsh-with-git'
+    $withGitHome = Join-Path $withGitRoot '.isolated-home'
+    $isolatedConfig = Join-Path $withGitHome '.gitconfig'
+    Copy-Template $withGitRoot
+    [IO.Directory]::CreateDirectory($withGitHome) | Out-Null
+    [IO.File]::WriteAllText(
+        $isolatedConfig,
+        "[user]`n`tname = Isolated Config Author`n`temail = isolated@example.invalid`n",
+        $utf8NoBom
+    )
+    $withGitEnvironment = @{
+        PATH = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+        HOME = $withGitHome
+        USERPROFILE = $withGitHome
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_GLOBAL = $isolatedConfig
+    }
+    $null = Invoke-WithEnvironment $pwshCommand.Source @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', 'Acme.WithGit',
+        '-GitHubOwner', 'safe-owner',
+        '-Description', 'Git config regression',
+        '-Year', '2042',
+        '-KeepScript'
+    ) $withGitRoot $withGitEnvironment
+    Assert-PowerShellIdentity $withGitRoot 'Acme.WithGit' 'Isolated Config Author' 'isolated@example.invalid'
+
+    $emptyConfigRoot = Join-Path $tempRoot 'pwsh-with-empty-git-config'
+    $emptyConfigHome = Join-Path $emptyConfigRoot '.isolated-home'
+    $emptyConfig = Join-Path $emptyConfigHome '.gitconfig'
+    Copy-Template $emptyConfigRoot
+    [IO.Directory]::CreateDirectory($emptyConfigHome) | Out-Null
+    [IO.File]::WriteAllText($emptyConfig, '', $utf8NoBom)
+    $emptyConfigEnvironment = @{
+        PATH = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+        HOME = $emptyConfigHome
+        USERPROFILE = $emptyConfigHome
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_GLOBAL = $emptyConfig
+    }
+    $null = Invoke-WithEnvironment $pwshCommand.Source @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', 'Acme.EmptyGitConfig',
+        '-GitHubOwner', 'safe-owner',
+        '-Description', 'Empty Git config regression',
+        '-Year', '2042',
+        '-KeepScript'
+    ) $emptyConfigRoot $emptyConfigEnvironment
+    Assert-PowerShellIdentity $emptyConfigRoot 'Acme.EmptyGitConfig' 'Your Name' 'you@example.com'
+
+    $explicitRoot = Join-Path $tempRoot 'pwsh-explicit-without-git'
+    $explicitHome = Join-Path $explicitRoot '.isolated-home'
+    Copy-Template $explicitRoot
+    [IO.Directory]::CreateDirectory($explicitHome) | Out-Null
+    $explicitEnvironment = @{
+        PATH = $emptyPath
+        HOME = $explicitHome
+        USERPROFILE = $explicitHome
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_GLOBAL = (Join-Path $explicitHome '.gitconfig')
+    }
+    $null = Invoke-WithEnvironment $pwshCommand.Source @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', 'Acme.Explicit',
+        '-Author', 'Explicit Author',
+        '-AuthorEmail', 'explicit@example.invalid',
+        '-GitHubOwner', 'safe-owner',
+        '-Description', 'Explicit identity regression',
+        '-Year', '2042',
+        '-KeepScript'
+    ) $explicitRoot $explicitEnvironment
+    Assert-PowerShellIdentity $explicitRoot 'Acme.Explicit' 'Explicit Author' 'explicit@example.invalid'
+
+    $traceRoot = Join-Path $tempRoot 'pwsh-explicit-git-trace'
+    $traceHome = Join-Path $traceRoot '.isolated-home'
+    $traceFile = Join-Path $traceRoot 'git-trace.json'
+    Copy-Template $traceRoot
+    [IO.Directory]::CreateDirectory($traceHome) | Out-Null
+    $traceEnvironment = @{
+        PATH = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+        HOME = $traceHome
+        USERPROFILE = $traceHome
+        GIT_CONFIG_NOSYSTEM = '1'
+        GIT_CONFIG_GLOBAL = (Join-Path $traceHome '.gitconfig')
+        GIT_TRACE2_EVENT = $traceFile
+    }
+    $null = Invoke-WithEnvironment $pwshCommand.Source @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', 'Acme.ExplicitTrace',
+        '-Author', 'Explicit Author',
+        '-AuthorEmail', 'explicit@example.invalid',
+        '-GitHubOwner', 'safe-owner',
+        '-Description', 'No Git invocation regression',
+        '-Year', '2042',
+        '-KeepScript'
+    ) $traceRoot $traceEnvironment
+    Assert-True (-not (Test-Path -LiteralPath $traceFile)) 'Explicit author values unexpectedly launched git.'
+    Assert-PowerShellIdentity $traceRoot 'Acme.ExplicitTrace' 'Explicit Author' 'explicit@example.invalid'
+}
+
 function Test-BuildAndTests([string]$root, [string]$projectName) {
     $null = Invoke-Native 'dotnet' @('build', "$projectName.slnx") $root
     $test = Invoke-Native 'dotnet' @(
@@ -364,6 +529,7 @@ try {
     Copy-Template $bashRoot
 
     Test-ScriptSyntax $pwshRoot
+    Test-PowerShellGitFallbacks
     $null = Invoke-Native 'pwsh' @(
         '-NoProfile',
         '-File', './scripts/init.ps1',
