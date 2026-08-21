@@ -11,9 +11,12 @@ $runnerPath = Join-Path $tempRoot 'invoke-test-linux.ps1'
 $dockerLog = Join-Path $tempRoot 'docker-arguments.jsonl'
 $dotnetLog = Join-Path $tempRoot 'dotnet-arguments.bin'
 $bashWrapper = Join-Path $tempRoot 'invoke-container-command.sh'
+$dockerShimProject = Join-Path $tempRoot 'docker-shim'
+$dockerShimOutput = Join-Path $tempRoot 'docker-shim-output'
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $pwsh = @(Get-Command pwsh -CommandType Application -ErrorAction Stop)[0]
 $bash = @(Get-Command bash -CommandType Application -ErrorAction Stop)[0]
+$dotnet = @(Get-Command dotnet -CommandType Application -ErrorAction Stop)[0]
 
 function Assert-Equal([object]$expected, [object]$actual, [string]$message) {
     if ($actual -cne $expected) {
@@ -109,6 +112,7 @@ function Invoke-TestCase(
     $environment = @{
         TEST_LINUX_SCRIPT = $scriptUnderTest
         TEST_DOCKER_LOG = $dockerLog
+        TEST_DOCKER_DIR = $dockerShimOutput
         TEST_CONFIGURATION = $configuration
         TEST_REBUILD = $(if ($rebuild) { '1' } else { '0' })
         TEST_HAS_FILTER = $(if ($hasFilter) { '1' } else { '0' })
@@ -145,31 +149,43 @@ function Invoke-TestCase(
     $imageIndex = [Array]::IndexOf($runArguments, 'test/image:latest')
     Assert-True ($imageIndex -ge 0) "$name did not pass the image as a Docker argument."
     $containerArguments = [string[]]$runArguments[($imageIndex + 1)..($runArguments.Count - 1)]
-    Assert-Equal 8 $containerArguments.Count "$name container command boundary changed."
+    $expectedFilterPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($filter))
+    $expectedContainerArgumentCount = if ($expectedFilterPayload) { 8 } else { 7 }
+    Assert-Equal $expectedContainerArgumentCount $containerArguments.Count "$name container command boundary changed."
     Assert-Equal 'bash' $containerArguments[0] "$name container command should use Bash."
     Assert-Equal '-c' $containerArguments[1] "$name container command should use a constant Bash program."
 
-    $program = $containerArguments[2]
+    $bootstrap = $containerArguments[2]
+    $programPayload = $containerArguments[3]
+    $program = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($programPayload))
     if ($filter) {
+        Assert-True (-not $bootstrap.Contains($filter)) "$name embedded filter data into executable bootstrap text."
         Assert-True (-not $program.Contains($filter)) "$name embedded filter data into executable Bash text."
     }
+    Assert-True (-not $bootstrap.Contains($configuration)) "$name embedded configuration data into executable bootstrap text."
     Assert-True (-not $program.Contains($configuration)) "$name embedded configuration data into executable Bash text."
-    $expectedTail = @(
-        'test-linux',
+    $expectedTail = [Collections.Generic.List[string]]::new()
+    $expectedTail.AddRange([string[]]@(
+        $programPayload,
         $configuration,
         $(if ($rebuild) { '1' } else { '0' }),
-        $(if ($hasFilter -and $filter) { '1' } else { '0' }),
-        $(if ($hasFilter) { $filter } else { '' })
-    )
-    Assert-Sequence $expectedTail $containerArguments[3..7] "$name changed positional container data."
+        $(if ($hasFilter -and $filter) { '1' } else { '0' })
+    ))
+    if ($expectedFilterPayload) {
+        $expectedTail.Add($expectedFilterPayload)
+    }
+    Assert-Sequence $expectedTail.ToArray() $containerArguments[3..($containerArguments.Count - 1)] "$name changed positional container data."
 
     $wrapperContent = $wrapperTemplate
     $wrapperContent = $wrapperContent.Replace(
         '__DOTNET_LOG_B64__',
         [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Convert-ToBashPath $dotnetLog))))
     $wrapperContent = $wrapperContent.Replace(
-        '__PROGRAM_B64__',
-        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($program)))
+        '__BOOTSTRAP_B64__',
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrap)))
+    $wrapperContent = $wrapperContent.Replace(
+        '__PROGRAM_PAYLOAD_B64__',
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($programPayload)))
     $wrapperContent = $wrapperContent.Replace(
         '__CONFIGURATION_B64__',
         [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($containerArguments[4])))
@@ -181,7 +197,8 @@ function Invoke-TestCase(
         [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($containerArguments[6])))
     $wrapperContent = $wrapperContent.Replace(
         '__FILTER_B64__',
-        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($containerArguments[7])))
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(
+            $(if ($containerArguments.Count -gt 7) { $containerArguments[7] } else { '' }))))
     [IO.File]::WriteAllText($bashWrapper, $wrapperContent.Replace("`r`n", "`n"), $utf8NoBom)
     $bashResult = Invoke-Process $bash.Source @((Convert-ToBashPath $bashWrapper)) $repoRoot
     if ($bashResult.ExitCode -ne 0) {
@@ -216,18 +233,55 @@ function Invoke-TestCase(
 
 try {
     [IO.Directory]::CreateDirectory($tempRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($dockerShimProject) | Out-Null
+    $dockerShimCsproj = @'
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<AssemblyName>docker</AssemblyName>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+</Project>
+'@
+    $dockerShimSource = @'
+using System.Text;
+using System.Text.Json;
+
+var logPath = Environment.GetEnvironmentVariable("TEST_DOCKER_LOG")
+	?? throw new InvalidOperationException("TEST_DOCKER_LOG is required.");
+await File.AppendAllTextAsync(
+	logPath,
+	JsonSerializer.Serialize(args) + "\n",
+	new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+'@
+    [IO.File]::WriteAllText(
+        (Join-Path $dockerShimProject 'docker.csproj'),
+        $dockerShimCsproj.Replace("`r`n", "`n"),
+        $utf8NoBom)
+    [IO.File]::WriteAllText(
+        (Join-Path $dockerShimProject 'Program.cs'),
+        $dockerShimSource.Replace("`r`n", "`n"),
+        $utf8NoBom)
+    $publishResult = Invoke-Process $dotnet.Source @(
+        'publish',
+        (Join-Path $dockerShimProject 'docker.csproj'),
+        '--configuration', 'Release',
+        '--output', $dockerShimOutput,
+        '--nologo',
+        '--verbosity', 'quiet'
+    ) $tempRoot
+    if ($publishResult.ExitCode -ne 0) {
+        throw "Failed to build the native Docker argument interceptor.`n$($publishResult.Output)"
+    }
+
     $runner = @'
 $ErrorActionPreference = 'Stop'
-function docker {
-    $arguments = [string[]]$args
-    $json = ConvertTo-Json -InputObject $arguments -Compress
-    [IO.File]::AppendAllText(
-        $env:TEST_DOCKER_LOG,
-        "$json`n",
-        [Text.UTF8Encoding]::new($false)
-    )
-    $global:LASTEXITCODE = 0
+if (Get-Variable PSNativeCommandArgumentPassing -ErrorAction SilentlyContinue) {
+    $PSNativeCommandArgumentPassing = 'Legacy'
 }
+$env:PATH = "$env:TEST_DOCKER_DIR$([IO.Path]::PathSeparator)$env:PATH"
 
 $invokeParameters = @{
     Image = 'test/image:latest'
@@ -266,12 +320,13 @@ dotnet() {
 export -f dotnet
 decode_into DOTNET_ARGUMENT_LOG '__DOTNET_LOG_B64__'
 export DOTNET_ARGUMENT_LOG
-decode_into program '__PROGRAM_B64__'
+decode_into bootstrap '__BOOTSTRAP_B64__'
+decode_into program_payload '__PROGRAM_PAYLOAD_B64__'
 decode_into configuration '__CONFIGURATION_B64__'
 decode_into rebuild '__REBUILD_B64__'
 decode_into has_filter '__HAS_FILTER_B64__'
 decode_into filter '__FILTER_B64__'
-exec bash -c "$program" test-linux "$configuration" "$rebuild" "$has_filter" "$filter"
+exec bash -c "$bootstrap" "$program_payload" "$configuration" "$rebuild" "$has_filter" "$filter"
 '@
 
     $ordinaryProgram = Invoke-TestCase 'ordinary-filter' 'Release' $false $true 'FullyQualifiedName~Greeter'
@@ -279,7 +334,7 @@ exec bash -c "$program" test-linux "$configuration" "$rebuild" "$has_filter" "$f
     $backtickMarker = Join-Path $tempRoot 'FILTER_BACKTICK_WAS_EXECUTED'
     $markerBash = Convert-ToBashPath $marker
     $backtickMarkerBash = Convert-ToBashPath $backtickMarker
-    $hostileFilter = 'FullyQualifiedName~"quoted" & $(touch "{0}"); `touch "{1}"` \ path' -f $markerBash, $backtickMarkerBash
+    $hostileFilter = 'FullyQualifiedName~\"quoted\" & $(touch "{0}"); `touch "{1}"` \ path' -f $markerBash, $backtickMarkerBash
     $hostileFilter += "`nsecond line"
     $hostileProgram = Invoke-TestCase 'hostile-filter-with-rebuild' 'Debug' $true $true $hostileFilter
     $unfilteredProgram = Invoke-TestCase 'unfiltered' 'Release' $false $false ''

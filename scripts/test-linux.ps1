@@ -70,7 +70,12 @@ set -e
 configuration=$1
 rebuild=$2
 has_filter=$3
-filter=$4
+filter_payload=$4
+filter=
+
+if [ "$has_filter" = '1' ]; then
+    IFS= read -r -d '' filter < <(printf '%s' "$filter_payload" | base64 --decode; printf '\0')
+fi
 
 if [ "$rebuild" = '1' ]; then
     dotnet clean -c "$configuration"
@@ -83,8 +88,11 @@ if [ "$has_filter" = '1' ]; then
 fi
 dotnet "${test_args[@]}"
 '@
+$bashScriptPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bashScript))
+$bashBootstrap = 'printf %s $0|base64 -d|bash -s -- $@'
 $rebuildFlag = if ($Rebuild) { '1' } else { '0' }
 $filterFlag = if ($Filter) { '1' } else { '0' }
+$filterPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$Filter))
 
 # Anonymous volumes shadow the host bin/obj folders inside the container so
 # Windows IDE artifacts cannot leak into the Linux build, and the Linux build
@@ -111,7 +119,7 @@ $dockerArgs += @(
     '-e', 'DOTNET_CLI_TELEMETRY_OPTOUT=1',
     '-e', 'DOTNET_NOLOGO=1',
     $Image,
-    'bash', '-c', $bashScript, 'test-linux', $Configuration, $rebuildFlag, $filterFlag, $Filter
+    'bash', '-c', $bashBootstrap, $bashScriptPayload, $Configuration, $rebuildFlag, $filterFlag, $filterPayload
 )
 
 Write-Host "==> Running tests in $Image" -ForegroundColor DarkGray
