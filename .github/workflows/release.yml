@@ -352,8 +352,8 @@ jobs:
       # the remote, so a fresh re-run starts clean.
       - name: Commit and tag the release (local only)
         env:
-          RELEASE_AUTHOR_B64: __AuthorBase64__
-          RELEASE_AUTHOR_EMAIL_B64: __AuthorEmailBase64__
+          RELEASE_AUTHOR_B64: '__AuthorBase64__'
+          RELEASE_AUTHOR_EMAIL_B64: '__AuthorEmailBase64__'
         run: |
           set -euo pipefail
           release_author="$(printf '%s' "$RELEASE_AUTHOR_B64" | base64 --decode)"

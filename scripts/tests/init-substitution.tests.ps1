@@ -134,6 +134,48 @@ function Assert-TreesEqual([string]$left, [string]$right) {
     }
 }
 
+function Get-WorkflowIdentityEnvironment([string]$root) {
+    $python = (Get-Command python -ErrorAction SilentlyContinue) ?? (Get-Command python3 -ErrorAction Stop)
+    $script = @'
+import json
+import pathlib
+
+import yaml
+
+workflow = yaml.safe_load(pathlib.Path(".github/workflows/release.yml").read_text(encoding="utf-8"))
+release_step = next(
+    step
+    for step in workflow["jobs"]["release"]["steps"]
+    if step.get("name") == "Commit and tag the release (local only)"
+)
+environment = release_step["env"]
+print(json.dumps({
+    "RELEASE_AUTHOR_B64": environment["RELEASE_AUTHOR_B64"],
+    "RELEASE_AUTHOR_EMAIL_B64": environment["RELEASE_AUTHOR_EMAIL_B64"],
+}))
+'@
+    $result = Invoke-Native $python.Source @('-c', $script) $root
+    return $result.Output | ConvertFrom-Json
+}
+
+function Assert-WorkflowIdentitySerialization(
+    [string]$root,
+    [string]$author,
+    [string]$authorEmail
+) {
+    $identityEnvironment = Get-WorkflowIdentityEnvironment $root
+    Assert-True ($identityEnvironment.RELEASE_AUTHOR_B64 -is [string]) 'Parsed release author base64 value is not a YAML string.'
+    Assert-True ($identityEnvironment.RELEASE_AUTHOR_EMAIL_B64 -is [string]) 'Parsed release author-email base64 value is not a YAML string.'
+    $expectedAuthorBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($author))
+    $expectedEmailBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($authorEmail))
+    Assert-Equal $expectedAuthorBase64 $identityEnvironment.RELEASE_AUTHOR_B64 'YAML parsing changed the release author base64 value.'
+    Assert-Equal $expectedEmailBase64 $identityEnvironment.RELEASE_AUTHOR_EMAIL_B64 'YAML parsing changed the release author-email base64 value.'
+    $decodedAuthor = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($identityEnvironment.RELEASE_AUTHOR_B64))
+    $decodedEmail = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($identityEnvironment.RELEASE_AUTHOR_EMAIL_B64))
+    Assert-Equal $author $decodedAuthor 'Release author serialization changed the value.'
+    Assert-Equal $authorEmail $decodedEmail 'Release author-email serialization changed the value.'
+}
+
 function Assert-GeneratedValues(
     [string]$root,
     [string]$projectName,
@@ -157,14 +199,7 @@ function Assert-GeneratedValues(
     Assert-True $license.Contains('__GitHubOwner__') 'Placeholder-like author input cascaded.'
 
     $workflow = [IO.File]::ReadAllText((Join-Path $root '.github/workflows/release.yml'))
-    $authorMatch = [regex]::Match($workflow, '(?m)^\s*RELEASE_AUTHOR_B64:\s*(\S+)\s*$')
-    $emailMatch = [regex]::Match($workflow, '(?m)^\s*RELEASE_AUTHOR_EMAIL_B64:\s*(\S+)\s*$')
-    Assert-True $authorMatch.Success 'Release author base64 value is missing.'
-    Assert-True $emailMatch.Success 'Release author-email base64 value is missing.'
-    $decodedAuthor = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($authorMatch.Groups[1].Value))
-    $decodedEmail = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($emailMatch.Groups[1].Value))
-    Assert-Equal $author $decodedAuthor 'Release author serialization changed the value.'
-    Assert-Equal $authorEmail $decodedEmail 'Release author-email serialization changed the value.'
+    Assert-WorkflowIdentitySerialization $root $author $authorEmail
     Assert-True $workflow.Contains("repo = `"https://github.com/$githubOwner/$projectName`"") 'Python repository URL was not generated safely.'
 }
 
@@ -268,6 +303,39 @@ function Test-RejectedInput([string]$initializer, [string]$field) {
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'INJECTED'))) 'Rejected input executed a command.'
 }
 
+function Test-NumericLookingBase64 {
+    $projectName = 'Acme.NumericBase64'
+    $author = 'Ӎ4'
+    $authorEmail = 'numeric@example.invalid'
+    $githubOwner = 'safe-owner'
+    $description = 'Numeric-looking base64 YAML regression'
+    $year = '2042'
+    $pwshRoot = Join-Path $tempRoot 'numeric-base64-pwsh'
+    $bashRoot = Join-Path $tempRoot 'numeric-base64-bash'
+    Copy-Template $pwshRoot
+    Copy-Template $bashRoot
+
+    $null = Invoke-Native 'pwsh' @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', $projectName,
+        '-Author', $author,
+        '-AuthorEmail', $authorEmail,
+        '-GitHubOwner', $githubOwner,
+        '-Description', $description,
+        '-Year', $year,
+        '-KeepScript'
+    ) $pwshRoot
+    $null = Invoke-BashInitializer $bashRoot $projectName $author $authorEmail $githubOwner $description $year
+
+    Assert-Equal '0400' ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($author))) 'Regression input no longer produces numeric-looking base64.'
+    Assert-TreesEqual $pwshRoot $bashRoot
+    Assert-WorkflowIdentitySerialization $pwshRoot $author $authorEmail
+    Assert-WorkflowIdentitySerialization $bashRoot $author $authorEmail
+    Test-GeneratedSyntax $pwshRoot
+    Test-GeneratedSyntax $bashRoot
+}
+
 function Test-BuildAndTests([string]$root, [string]$projectName) {
     $null = Invoke-Native 'dotnet' @('build', "$projectName.slnx") $root
     $test = Invoke-Native 'dotnet' @(
@@ -313,6 +381,7 @@ try {
     Assert-GeneratedValues $pwshRoot $projectName $author $authorEmail $githubOwner $description $year
     Test-GeneratedSyntax $pwshRoot
     Test-WorkflowIdentity $pwshRoot $author $authorEmail
+    Test-NumericLookingBase64
     Test-RejectedInput 'pwsh' 'newline'
     Test-RejectedInput 'bash' 'newline'
     Test-RejectedInput 'pwsh' 'owner'
