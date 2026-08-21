@@ -103,6 +103,12 @@ assumptions a past agent got wrong:
    pinned .NET SDK. The test uses and cleans a temporary directory outside the
    checkout; the initializer removes the template-only regression script from a
    generated repository.
+
+   Before shipping release-workflow changes, also run
+   `pwsh ./scripts/tests/release-state.tests.ps1`. The generated workflow pins one
+   dispatch source SHA for checkout, build, versioning, tag, and recovery; it must
+   fail before NuGet if remote `main` moved, and a post-pivot recovery must use only
+   the exact bundle and integrity manifest from that run.
 5. Replace the placeholder `Greeter` type with the real API, delete the sample
    test, fill in the `CLAUDE.md` "Architecture" section, and work through the
    `TEMPLATE.md` post-setup checklist.

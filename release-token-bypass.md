@@ -85,7 +85,10 @@ The "Mint GitHub App token" step should run (not be skipped), and the "Push the
 release commit + tag (atomic)" step should succeed. If the push is rejected with a
 protected-branch error, re-check step 5 — the App must be in the ruleset's bypass
 list, and the ruleset (not a legacy "branch protection rule") is where the bypass
-lives.
+lives. The workflow captures the dispatch commit and requires `origin/main` to stay
+at that exact SHA through the NuGet pivot; its post-pivot push uses the same SHA as
+an expected-old lease. A concurrent `main` update therefore stops publication before
+NuGet when detected pre-pivot, or refuses to overwrite the update during recovery.
 
 ## Notes
 
@@ -97,6 +100,11 @@ lives.
   data; quotes, backslashes, and shell metacharacters in the single-line values are
   not executed. The *pusher* is the App. That is expected — the bypass keys on the
   pusher, not the commit author.
+- After any attempted or accepted NuGet publish, recover only from that run's
+  `release-recovery-vX.Y.Z` artifact. Verify its package `SHA256SUMS` and the exact
+  source SHA, release SHA, tag, bundle hash, and notes hash recorded in
+  `release-recovery-manifest.txt`; never rebuild substitute artifacts or move a
+  concurrently advanced `main`.
 - If you would rather not push to `main` at all from CI, the alternative is to drop
   the "Push the release commit + tag" step and open a PR with the release commit
   instead — but then the tag/version bump only lands once that PR merges, which the

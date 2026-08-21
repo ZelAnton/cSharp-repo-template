@@ -271,12 +271,14 @@ function Test-WorkflowIdentity(
     [string]$authorEmail
 ) {
     $workflowLines = [IO.File]::ReadAllLines((Join-Path $root '.github/workflows/release.yml'))
-    $start = [Array]::IndexOf($workflowLines, '          set -euo pipefail', 340)
+    $commitStep = [Array]::IndexOf($workflowLines, '      - name: Commit and tag the release (local only)')
+    $start = [Array]::IndexOf($workflowLines, '          release_author="$(printf ''%s'' "$RELEASE_AUTHOR_B64" | base64 --decode)"', $commitStep)
     $end = [Array]::IndexOf($workflowLines, '          git config user.email "$release_author_email"', $start)
-    Assert-True ($start -ge 0 -and $end -ge $start) 'Could not extract the release identity shell block.'
+    Assert-True ($commitStep -ge 0 -and $start -ge $commitStep -and $end -ge $start) 'Could not extract the release identity shell block.'
     $authorBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($author))
     $emailBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($authorEmail))
     $snippetLines = @(
+        'set -euo pipefail'
         "export RELEASE_AUTHOR_B64='$authorBase64'"
         "export RELEASE_AUTHOR_EMAIL_B64='$emailBase64'"
     ) + @($workflowLines[$start..$end] | ForEach-Object { $_.Substring(10) })

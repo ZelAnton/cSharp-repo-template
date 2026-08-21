@@ -33,7 +33,10 @@ jobs:
       # cancellation, or unclassified client failure after an attempt is ambiguous
       # and preserves exact recovery state. Once NuGet accepts the package, never
       # re-run or rebuild this release, even if the tag push failed: recover only
-      # from this run's immutable release-recovery-vX.Y.Z artifact.
+      # from this run's immutable release-recovery-vX.Y.Z artifact. The dispatch
+      # commit is captured as one immutable source SHA before checkout. Immediately
+      # before the pivot, origin/main must still equal that SHA; the later atomic
+      # push advances it only under an exact expected-old lease.
       #
       # The "Push the release commit + tag" step pushes straight to main. If you
       # protect main with a rule that requires pull requests or status checks, that
@@ -83,6 +86,23 @@ jobs:
           fi
           echo "Required secrets present."
 
+      # workflow_dispatch supplies the exact commit that contained the workflow
+      # selected from main. Capture it before checkout and never resolve the moving
+      # branch name as release input later in the job.
+      - name: Capture immutable release source
+        id: release_source
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="${DISPATCH_SHA,,}"
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The dispatch source is not a full commit SHA (got: '$DISPATCH_SHA')."
+            exit 1
+          fi
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Release source fixed at $SOURCE_SHA."
+
       # Mint a short-lived GitHub App installation token. Pushing the release commit
       # to `main` with it makes the **App** the actor — and the App sits in the
       # branch-protection ruleset's bypass list, so the push is allowed. The default
@@ -102,12 +122,24 @@ jobs:
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
         with:
-          ref: main
+          ref: ${{ steps.release_source.outputs.sha }}
           fetch-depth: 0
           # Persist the App token so the later `git push` to `main` runs as the App
           # (and thus uses its ruleset bypass). Empty when the App isn't configured →
           # fall back to the default token.
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Verify immutable release source checkout
+        env:
+          SOURCE_SHA: ${{ steps.release_source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          CHECKED_OUT_SHA="$(git rev-parse --verify HEAD)"
+          if [[ "$CHECKED_OUT_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::Checkout resolved to $CHECKED_OUT_SHA instead of immutable release source $SOURCE_SHA."
+            exit 1
+          fi
+          echo "Checked out immutable release source $SOURCE_SHA."
 
       - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
@@ -358,18 +390,37 @@ jobs:
       # below). Keeping it local means a failure before NuGet accepts the package
       # leaves nothing on the remote, so a fresh re-run starts clean.
       - name: Commit and tag the release (local only)
+        id: release_commit
         env:
           RELEASE_AUTHOR_B64: '__AuthorBase64__'
           RELEASE_AUTHOR_EMAIL_B64: '__AuthorEmailBase64__'
+          SOURCE_SHA: ${{ steps.release_source.outputs.sha }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
+          if [[ "$(git rev-parse --verify HEAD)" != "$SOURCE_SHA" ]]; then
+            echo "::error::Release inputs are no longer based on immutable source $SOURCE_SHA."
+            exit 1
+          fi
           release_author="$(printf '%s' "$RELEASE_AUTHOR_B64" | base64 --decode)"
           release_author_email="$(printf '%s' "$RELEASE_AUTHOR_EMAIL_B64" | base64 --decode)"
           git config user.name "$release_author"
           git config user.email "$release_author_email"
           git add src/__ProjectName__/__ProjectName__.csproj CHANGELOG.md
-          git commit -m "Release ${{ steps.version.outputs.tag }}"
-          git tag "${{ steps.version.outputs.tag }}"
+          git commit -m "Release $TAG"
+          RELEASE_SHA="$(git rev-parse --verify HEAD)"
+          RELEASE_PARENT="$(git rev-parse --verify HEAD^)"
+          if [[ "$RELEASE_PARENT" != "$SOURCE_SHA" ]]; then
+            echo "::error::Release commit $RELEASE_SHA is not a direct child of immutable source $SOURCE_SHA."
+            exit 1
+          fi
+          git tag "$TAG" "$RELEASE_SHA"
+          if [[ "$(git rev-parse --verify "$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
+            echo "::error::Release tag $TAG does not resolve to release commit $RELEASE_SHA."
+            exit 1
+          fi
+          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Release commit fixed at $RELEASE_SHA (source $SOURCE_SHA)."
 
       # Keep the exact local release commit/tag available for post-pivot recovery.
       # The bundle stays on the ephemeral runner unless a later post-publish step
@@ -377,11 +428,86 @@ jobs:
       # packages and notes produced above.
       - name: Create local release recovery bundle
         env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ steps.release_source.outputs.sha }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
+          if [[ "$(git rev-parse --verify HEAD)" != "$RELEASE_SHA" ]] \
+             || [[ "$(git rev-parse --verify HEAD^)" != "$SOURCE_SHA" ]] \
+             || [[ "$(git rev-parse --verify "$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
+            echo "::error::Release commit, parent, or tag drifted before recovery capture."
+            exit 1
+          fi
+          # HEAD was verified above and is intentionally recorded as the bundle's
+          # checkout target; a raw object ID alone would clone without a usable HEAD.
           git bundle create ./artifacts/release-recovery.bundle HEAD "$TAG"
           git bundle verify ./artifacts/release-recovery.bundle
+          CHECKSUMS_SHA256="$(sha256sum ./artifacts/SHA256SUMS | cut -d' ' -f1)"
+          BUNDLE_SHA256="$(sha256sum ./artifacts/release-recovery.bundle | cut -d' ' -f1)"
+          NOTES_SHA256="$(sha256sum ./release-notes.md | cut -d' ' -f1)"
+          printf '%s\n' \
+            'schema=release-recovery-v1' \
+            "repository=$GITHUB_REPOSITORY" \
+            "source_sha=$SOURCE_SHA" \
+            "release_sha=$RELEASE_SHA" \
+            "tag=$TAG" \
+            "package_checksums_sha256=$CHECKSUMS_SHA256" \
+            "bundle_sha256=$BUNDLE_SHA256" \
+            "release_notes_sha256=$NOTES_SHA256" \
+            > ./artifacts/release-recovery-manifest.txt
+
+      # The NuGet pivot may only consume the immutable dispatch source. Check the
+      # authoritative remote ref immediately before the first registry attempt and
+      # re-verify the exact local release lineage and recovery payload.
+      - name: Guard — remote main unchanged before NuGet pivot
+        env:
+          SOURCE_SHA: ${{ steps.release_source.outputs.sha }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          REMOTE_MAIN="$(git ls-remote --exit-code origin refs/heads/main | awk 'NR == 1 { print $1 }')"
+          REMOTE_TAG="$(git ls-remote origin "refs/tags/$TAG" | awk 'NR == 1 { print $1 }')"
+          if [[ ! "$REMOTE_MAIN" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve origin/main to one full commit SHA."
+            exit 1
+          fi
+          if [[ "$REMOTE_MAIN" != "$SOURCE_SHA" ]]; then
+            echo "::error::origin/main moved from immutable release source $SOURCE_SHA" \
+              "to $REMOTE_MAIN before NuGet publication."
+            echo "::error::No package was published; start a fresh release from the new main."
+            exit 1
+          fi
+          if [[ -n "$REMOTE_TAG" ]]; then
+            echo "::error::Remote tag $TAG appeared at $REMOTE_TAG before NuGet publication."
+            echo "::error::No package was published; reconcile the existing release state first."
+            exit 1
+          fi
+          if [[ "$(git rev-parse --verify HEAD)" != "$RELEASE_SHA" ]] \
+             || [[ "$(git rev-parse --verify HEAD^)" != "$SOURCE_SHA" ]] \
+             || [[ "$(git rev-parse --verify "$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
+            echo "::error::Release commit, source ancestry, or tag changed before NuGet publication."
+            exit 1
+          fi
+          (
+            cd ./artifacts
+            sha256sum --check SHA256SUMS
+          )
+          grep -Fx "source_sha=$SOURCE_SHA" ./artifacts/release-recovery-manifest.txt >/dev/null
+          grep -Fx "release_sha=$RELEASE_SHA" ./artifacts/release-recovery-manifest.txt >/dev/null
+          grep -Fx "tag=$TAG" ./artifacts/release-recovery-manifest.txt >/dev/null
+          CHECKSUMS_SHA256="$(sha256sum ./artifacts/SHA256SUMS | cut -d' ' -f1)"
+          BUNDLE_SHA256="$(sha256sum ./artifacts/release-recovery.bundle | cut -d' ' -f1)"
+          NOTES_SHA256="$(sha256sum ./release-notes.md | cut -d' ' -f1)"
+          grep -Fx "package_checksums_sha256=$CHECKSUMS_SHA256" \
+            ./artifacts/release-recovery-manifest.txt >/dev/null
+          grep -Fx "bundle_sha256=$BUNDLE_SHA256" \
+            ./artifacts/release-recovery-manifest.txt >/dev/null
+          grep -Fx "release_notes_sha256=$NOTES_SHA256" \
+            ./artifacts/release-recovery-manifest.txt >/dev/null
+          echo "Remote main and exact release state are unchanged at the NuGet pivot."
 
       # === PIVOT: the single irreversible step ===
       # NuGet publishing cannot be undone (a pushed version can only be unlisted,
@@ -614,11 +740,30 @@ jobs:
       # recovery without rebuilding or republishing.
       - name: Push the release commit + tag (atomic)
         env:
+          SOURCE_SHA: ${{ steps.release_source.outputs.sha }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if git push --atomic origin HEAD:refs/heads/main "$TAG"; then
+            REMOTE_MAIN="$(git ls-remote origin refs/heads/main | awk 'NR == 1 { print $1 }')"
+            REMOTE_TAG="$(git ls-remote origin "refs/tags/$TAG" | awk 'NR == 1 { print $1 }')"
+            if [[ "$REMOTE_MAIN" == "$RELEASE_SHA" && "$REMOTE_TAG" == "$RELEASE_SHA" ]]; then
+              echo "Exact release commit and tag were already pushed by this run."
+              exit 0
+            fi
+            if [[ "$REMOTE_MAIN" != "$SOURCE_SHA" ]]; then
+              echo "::error::origin/main is $REMOTE_MAIN, not expected source" \
+                "$SOURCE_SHA; refusing to overwrite remote movement."
+              break
+            fi
+            if [[ -n "$REMOTE_TAG" ]]; then
+              echo "::error::Remote tag $TAG already exists at $REMOTE_TAG instead of" \
+                "exact release commit $RELEASE_SHA."
+              break
+            fi
+            if git push --atomic --force-with-lease="refs/heads/main:$SOURCE_SHA" origin \
+                "$RELEASE_SHA:refs/heads/main" "refs/tags/$TAG"; then
               echo "Release commit and tag push succeeded (attempt $attempt)."
               exit 0
             fi
@@ -628,9 +773,13 @@ jobs:
           echo "::error::The package is ALREADY on nuget.org, but the release commit and tag were not pushed."
           echo "::error::Do not rebuild or re-run the whole workflow."
           echo "::error::Download the release-recovery-$TAG artifact saved by the final step, then run:"
+          echo "::error::Verify SHA256SUMS and the hashes/SHAs in release-recovery-manifest.txt before continuing."
           echo "::error::git clone ./artifacts/release-recovery.bundle release-recovery"
           echo "::error::git -C release-recovery remote set-url origin https://github.com/${{ github.repository }}.git"
-          echo "::error::git -C release-recovery push --atomic origin HEAD:refs/heads/main refs/tags/$TAG"
+          RECOVERY_PUSH="git -C release-recovery push --atomic"
+          RECOVERY_PUSH+=" --force-with-lease=refs/heads/main:$SOURCE_SHA"
+          RECOVERY_PUSH+=" origin $RELEASE_SHA:refs/heads/main refs/tags/$TAG"
+          echo "::error::$RECOVERY_PUSH"
           exit 1
 
       # Final, recreatable step, made idempotent (edit the Release if it already
@@ -697,6 +846,7 @@ jobs:
             artifacts/*.snupkg
             artifacts/SHA256SUMS
             artifacts/release-recovery.bundle
+            artifacts/release-recovery-manifest.txt
             release-notes.md
           if-no-files-found: error
           retention-days: 30
