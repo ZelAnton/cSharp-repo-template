@@ -107,8 +107,10 @@ assumptions a past agent got wrong:
    Before shipping release-workflow changes, also run
    `pwsh ./scripts/tests/release-state.tests.ps1`. The generated workflow pins one
    dispatch source SHA for checkout, build, versioning, tag, and recovery; it must
-   fail before NuGet if remote `main` moved, and a post-pivot recovery must use only
-   the exact bundle and integrity manifest from that run.
+   select the highest exact stable SemVer tag reachable from that SHA, ignore
+   similar or unrelated-history tags, fail before NuGet if remote `main` moved, and
+   use only the exact bundle and integrity manifest from that run for post-pivot
+   recovery.
 5. Replace the placeholder `Greeter` type with the real API, delete the sample
    test, fill in the `CLAUDE.md` "Architecture" section, and work through the
    `TEMPLATE.md` post-setup checklist.

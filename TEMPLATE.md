@@ -165,7 +165,10 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 - **Release ordering** — the NuGet publish is the single irreversible step, so the
   workflow makes it the pivot. It captures the dispatch commit as a full immutable
   source SHA, checks out that SHA, and derives the version, package, notes, local
-  release commit, and tag from it. Immediately before publication, `origin/main`
+  release commit, and tag from it. Versioning considers only exact stable
+  `vMAJOR.MINOR.PATCH` tag refs reachable from that source, then chooses the highest
+  SemVer value; branch names, prerelease-like tags, and tags on unrelated history do
+  not affect the result. Immediately before publication, `origin/main`
   must still equal the captured source; otherwise the workflow stops without a
   NuGet attempt. After acceptance, the atomic push can advance `main` only from that
   exact expected SHA. A structured terminal rejection proves that NuGet did not

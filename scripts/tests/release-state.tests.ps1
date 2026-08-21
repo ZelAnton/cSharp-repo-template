@@ -337,6 +337,34 @@ function Assert-RecoveryGuard(
     Assert-Equal $expected ($terminalFailure -and $recoveryRequired) $message
 }
 
+function Assert-VersionSelection(
+    [string]$name,
+    [string]$caseRoot,
+    [string]$script,
+    [string]$expectedCurrent,
+    [string]$expectedVersion,
+    [string]$expectedPreviousTag,
+    [bool]$expectedFirstRelease
+) {
+    $outputPath = Join-Path $caseRoot 'github-output.txt'
+    $sourceSha = @(Invoke-Git $caseRoot @('rev-parse', 'HEAD'))[-1]
+    [void](Invoke-BashBlock `
+        -WorkingDirectory $caseRoot `
+        -ScriptName 'determine-version.sh' `
+        -Script $script `
+        -Environment @{
+            GITHUB_OUTPUT = $outputPath
+            SOURCE_SHA = $sourceSha
+        })
+    $outputs = Read-GitHubOutputs $outputPath
+    Assert-Equal $expectedCurrent $outputs['current'] "$name selected the wrong current version."
+    Assert-Equal $expectedVersion $outputs['version'] "$name computed the wrong next version."
+    Assert-Equal "v$expectedVersion" $outputs['tag'] "$name computed the wrong next tag."
+    Assert-Equal $expectedPreviousTag $outputs['previous_tag'] "$name selected the wrong previous tag."
+    Assert-Equal $expectedFirstRelease.ToString().ToLowerInvariant() $outputs['first_release'] "$name reported the wrong first-release mode."
+    Write-Host "PASS $name"
+}
+
 function Invoke-ReleaseStateCase(
     [string]$name,
     [string]$version,
@@ -480,6 +508,8 @@ try {
     $claude = [IO.File]::ReadAllText($claudePath)
     $template = [IO.File]::ReadAllText($templatePath)
     $changelogGuidance = [IO.File]::ReadAllText($changelogGuidancePath)
+    $versionScript = (Get-WorkflowRunScript $workflow 'Determine next version').Replace('${{ inputs.bump }}', 'patch')
+    $verifyTagScript = (Get-WorkflowRunScript $workflow 'Verify tag does not exist').Replace('${{ steps.version.outputs.tag }}', 'v10.2.1')
     $promoteScript = Get-WorkflowPython $workflow 'Promote Unreleased section in CHANGELOG.md'
     $extractScript = Get-WorkflowPython $workflow 'Extract release notes from release section'
     $publishScript = Get-WorkflowPython $workflow 'Push to NuGet.org (irreversible pivot)'
@@ -525,8 +555,12 @@ try {
     Assert-True $project.Contains('<None Include="$(RepoRoot)CHANGELOG.md" Pack="true" PackagePath="\" />') 'The package no longer includes the root release-state CHANGELOG.md.'
     Assert-True $project.Contains('<PackageReleaseNotes Condition="Exists(''$(RepoRoot)release-notes.md'')">$([System.IO.File]::ReadAllText(''$(RepoRoot)release-notes.md''))</PackageReleaseNotes>') 'The package no longer consumes the extracted release notes.'
     Assert-True $workflow.Contains('git add src/__ProjectName__/__ProjectName__.csproj CHANGELOG.md') 'The local release commit no longer records both release-state inputs.'
-    Assert-True $workflow.Contains('git bundle create ./artifacts/release-recovery.bundle HEAD "$TAG"') 'The workflow no longer preserves a cloneable exact release commit and tag for recovery.'
+    Assert-True $workflow.Contains('git bundle create ./artifacts/release-recovery.bundle HEAD "refs/tags/$TAG"') 'The workflow no longer preserves a cloneable exact release commit and tag for recovery.'
     Assert-True $workflow.Contains('"$(git rev-parse --verify HEAD^)" != "$SOURCE_SHA"') 'The workflow no longer verifies release ancestry against the immutable source.'
+    Assert-True $versionScript.Contains('git for-each-ref --merged="$SOURCE_SHA"') 'Release-tag discovery is no longer limited to the immutable source history.'
+    Assert-True $versionScript.Contains('^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') 'Release-tag discovery no longer requires exact stable SemVer tag names.'
+    Assert-True $verifyTagScript.Contains('git show-ref --verify --quiet "refs/tags/v10.2.1"') 'New-tag existence checks no longer address the exact tag ref.'
+    Assert-True $workflow.Contains('git rev-parse --verify "refs/tags/$TAG^{commit}"') 'Release-tag integrity checks no longer peel the exact tag ref.'
     Assert-True $workflow.Contains('--force-with-lease="refs/heads/main:$SOURCE_SHA"') 'The remote main update is no longer bound to the exact captured source SHA.'
     Assert-True $workflow.Contains('artifacts/release-recovery-manifest.txt') 'The exact recovery artifact no longer includes source, release, tag, and integrity metadata.'
     Assert-True $workflow.Contains('id: nuget_publish') 'The NuGet pivot no longer exposes its outcome to the recovery guard.'
@@ -570,6 +604,67 @@ try {
         Assert-True $guidance.Contains('release-recovery-vX.Y.Z') 'Shipped release guidance must direct post-pivot recovery to the immutable recovery artifact.'
     }
     Assert-True $workflow.Contains('Once NuGet accepts the package,') 'The workflow header must prohibit rebuilding as soon as the package is accepted.'
+
+    $versionRoot = Join-Path $tempRoot 'reachable-semver-selection'
+    [IO.Directory]::CreateDirectory((Join-Path $versionRoot 'src/__ProjectName__')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $versionRoot 'src/__ProjectName__/__ProjectName__.csproj'), '<Project><PropertyGroup><Version>1.0.0</Version></PropertyGroup></Project>', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $versionRoot 'payload.txt'), "initial`n", $utf8NoBom)
+    [void](Invoke-Git $versionRoot @('init', '--initial-branch=main'))
+    [void](Invoke-Git $versionRoot @('config', 'user.name', 'Release Test'))
+    [void](Invoke-Git $versionRoot @('config', 'user.email', 'release-test@example.invalid'))
+    [void](Invoke-Git $versionRoot @('add', '.'))
+    [void](Invoke-Git $versionRoot @('commit', '-m', 'Initial release line'))
+    [void](Invoke-Git $versionRoot @('tag', 'v1.2.3'))
+    [IO.File]::WriteAllText((Join-Path $versionRoot 'payload.txt'), "second`n", $utf8NoBom)
+    [void](Invoke-Git $versionRoot @('add', 'payload.txt'))
+    [void](Invoke-Git $versionRoot @('commit', '-m', 'Second release line'))
+    [void](Invoke-Git $versionRoot @('tag', 'v2.9.0'))
+    [IO.File]::WriteAllText((Join-Path $versionRoot 'payload.txt'), "third`n", $utf8NoBom)
+    [void](Invoke-Git $versionRoot @('add', 'payload.txt'))
+    [void](Invoke-Git $versionRoot @('commit', '-m', 'Third release line'))
+    [void](Invoke-Git $versionRoot @('tag', '-a', 'v10.2.0', '-m', 'Annotated stable release'))
+    [void](Invoke-Git $versionRoot @('tag', 'v999.0.0-rc.1'))
+    [void](Invoke-Git $versionRoot @('branch', 'v10.2.1'))
+    [void](Invoke-Git $versionRoot @('branch', 'alternate-release', 'HEAD~2'))
+    [void](Invoke-Git $versionRoot @('switch', 'alternate-release'))
+    [IO.File]::WriteAllText((Join-Path $versionRoot 'alternate.txt'), "unreachable`n", $utf8NoBom)
+    [void](Invoke-Git $versionRoot @('add', 'alternate.txt'))
+    [void](Invoke-Git $versionRoot @('commit', '-m', 'Unreachable release line'))
+    [void](Invoke-Git $versionRoot @('tag', 'v999.0.0'))
+    [void](Invoke-Git $versionRoot @('switch', 'main'))
+    Assert-VersionSelection 'reachable-stable-semver-max' $versionRoot $versionScript '10.2.0' '10.2.1' 'v10.2.0' $false
+    [void](Invoke-BashBlock `
+        -WorkingDirectory $versionRoot `
+        -ScriptName 'verify-new-tag.sh' `
+        -Script $verifyTagScript `
+        -Environment @{})
+    [void](Invoke-Git $versionRoot @('tag', '-a', 'v10.2.1', '-m', 'Existing annotated release'))
+    $existingTagFailure = Invoke-BashBlock `
+        -WorkingDirectory $versionRoot `
+        -ScriptName 'verify-existing-tag.sh' `
+        -Script $verifyTagScript `
+        -Environment @{} `
+        -ExpectFailure
+    Assert-True $existingTagFailure.Contains('Tag v10.2.1 already exists') 'The exact-ref guard did not reject an annotated tag sharing a name with a branch.'
+    Write-Host 'PASS exact-tag-ref-disambiguation'
+
+    $firstReleaseRoot = Join-Path $tempRoot 'first-release-with-unusable-tags'
+    [IO.Directory]::CreateDirectory((Join-Path $firstReleaseRoot 'src/__ProjectName__')) | Out-Null
+    [IO.File]::WriteAllText((Join-Path $firstReleaseRoot 'src/__ProjectName__/__ProjectName__.csproj'), '<Project><PropertyGroup><Version>1.4.0</Version></PropertyGroup></Project>', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $firstReleaseRoot 'payload.txt'), "main`n", $utf8NoBom)
+    [void](Invoke-Git $firstReleaseRoot @('init', '--initial-branch=main'))
+    [void](Invoke-Git $firstReleaseRoot @('config', 'user.name', 'Release Test'))
+    [void](Invoke-Git $firstReleaseRoot @('config', 'user.email', 'release-test@example.invalid'))
+    [void](Invoke-Git $firstReleaseRoot @('add', '.'))
+    [void](Invoke-Git $firstReleaseRoot @('commit', '-m', 'First release source'))
+    [void](Invoke-Git $firstReleaseRoot @('tag', 'v999.0.0-preview.1'))
+    [void](Invoke-Git $firstReleaseRoot @('switch', '-c', 'unreachable-release'))
+    [IO.File]::WriteAllText((Join-Path $firstReleaseRoot 'unreachable.txt'), "side`n", $utf8NoBom)
+    [void](Invoke-Git $firstReleaseRoot @('add', 'unreachable.txt'))
+    [void](Invoke-Git $firstReleaseRoot @('commit', '-m', 'Unreachable tagged commit'))
+    [void](Invoke-Git $firstReleaseRoot @('tag', 'v999.0.0'))
+    [void](Invoke-Git $firstReleaseRoot @('switch', 'main'))
+    Assert-VersionSelection 'first-release-ignores-unusable-tags' $firstReleaseRoot $versionScript '0.0.0' '1.4.0' '' $true
 
     $rejectedCase = Join-Path $tempRoot 'confirmed-rejection'
     [IO.Directory]::CreateDirectory((Join-Path $rejectedCase 'artifacts')) | Out-Null

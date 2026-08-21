@@ -147,9 +147,22 @@ jobs:
 
       - name: Determine next version
         id: version
+        env:
+          SOURCE_SHA: ${{ steps.release_source.outputs.sha }}
         run: |
           set -euo pipefail
-          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          RELEASE_TAGS=()
+          while IFS= read -r CANDIDATE; do
+            if [[ "$CANDIDATE" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              RELEASE_TAGS+=("$CANDIDATE")
+            fi
+          done < <(git for-each-ref --merged="$SOURCE_SHA" --sort=version:refname \
+            --format='%(refname:strip=2)' refs/tags)
+
+          LATEST_TAG=""
+          if (( ${#RELEASE_TAGS[@]} > 0 )); then
+            LATEST_TAG="${RELEASE_TAGS[${#RELEASE_TAGS[@]} - 1]}"
+          fi
           if [[ -n "$LATEST_TAG" ]]; then
             FIRST_RELEASE=false
             PREVIOUS_TAG="$LATEST_TAG"
@@ -187,7 +200,8 @@ jobs:
 
       - name: Verify tag does not exist
         run: |
-          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/${{ steps.version.outputs.tag }}"; then
             echo "::error::Tag ${{ steps.version.outputs.tag }} already exists"
             exit 1
           fi
@@ -415,7 +429,7 @@ jobs:
             exit 1
           fi
           git tag "$TAG" "$RELEASE_SHA"
-          if [[ "$(git rev-parse --verify "$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
+          if [[ "$(git rev-parse --verify "refs/tags/$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
             echo "::error::Release tag $TAG does not resolve to release commit $RELEASE_SHA."
             exit 1
           fi
@@ -436,13 +450,13 @@ jobs:
           set -euo pipefail
           if [[ "$(git rev-parse --verify HEAD)" != "$RELEASE_SHA" ]] \
              || [[ "$(git rev-parse --verify HEAD^)" != "$SOURCE_SHA" ]] \
-             || [[ "$(git rev-parse --verify "$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
+             || [[ "$(git rev-parse --verify "refs/tags/$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
             echo "::error::Release commit, parent, or tag drifted before recovery capture."
             exit 1
           fi
           # HEAD was verified above and is intentionally recorded as the bundle's
           # checkout target; a raw object ID alone would clone without a usable HEAD.
-          git bundle create ./artifacts/release-recovery.bundle HEAD "$TAG"
+          git bundle create ./artifacts/release-recovery.bundle HEAD "refs/tags/$TAG"
           git bundle verify ./artifacts/release-recovery.bundle
           CHECKSUMS_SHA256="$(sha256sum ./artifacts/SHA256SUMS | cut -d' ' -f1)"
           BUNDLE_SHA256="$(sha256sum ./artifacts/release-recovery.bundle | cut -d' ' -f1)"
@@ -487,7 +501,7 @@ jobs:
           fi
           if [[ "$(git rev-parse --verify HEAD)" != "$RELEASE_SHA" ]] \
              || [[ "$(git rev-parse --verify HEAD^)" != "$SOURCE_SHA" ]] \
-             || [[ "$(git rev-parse --verify "$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
+             || [[ "$(git rev-parse --verify "refs/tags/$TAG^{commit}")" != "$RELEASE_SHA" ]]; then
             echo "::error::Release commit, source ancestry, or tag changed before NuGet publication."
             exit 1
           fi
