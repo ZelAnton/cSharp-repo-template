@@ -86,10 +86,11 @@ function Invoke-PythonBlock(
     [string]$scriptName,
     [string]$script,
     [hashtable]$environment,
+    [string]$prelude = '',
     [switch]$ExpectFailure
 ) {
     $scriptPath = Join-Path $workingDirectory $scriptName
-    [IO.File]::WriteAllText($scriptPath, "$script`n", $utf8NoBom)
+    [IO.File]::WriteAllText($scriptPath, "$prelude$script`n", $utf8NoBom)
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $python.Source
@@ -260,6 +261,8 @@ try {
     $changelogGuidance = [IO.File]::ReadAllText($changelogGuidancePath)
     $promoteScript = Get-WorkflowPython $workflow 'Promote Unreleased section in CHANGELOG.md'
     $extractScript = Get-WorkflowPython $workflow 'Extract release notes from release section'
+    $publishScript = Get-WorkflowPython $workflow 'Push to NuGet.org (irreversible pivot)'
+    $publishStep = Get-WorkflowStepBlock $workflow 'Push to NuGet.org (irreversible pivot)'
     $recoveryStep = Get-WorkflowStepBlock $workflow 'Preserve exact post-pivot recovery state'
 
     $steps = [ordered]@{
@@ -293,7 +296,12 @@ try {
     Assert-True $workflow.Contains('git add src/__ProjectName__/__ProjectName__.csproj CHANGELOG.md') 'The local release commit no longer records both release-state inputs.'
     Assert-True $workflow.Contains('git bundle create ./artifacts/release-recovery.bundle HEAD "$TAG"') 'The workflow no longer preserves the exact local release commit and tag for recovery.'
     Assert-True $workflow.Contains('id: nuget_publish') 'The NuGet pivot no longer exposes its outcome to the recovery guard.'
-    Assert-True $recoveryStep.Contains('if: ${{ failure() && steps.nuget_publish.outcome == ''success'' }}') 'Recovery state is not restricted to failures after a successful NuGet publish.'
+    Assert-False $publishStep.Contains('continue-on-error: true') 'An ambiguous NuGet outcome must stop VCS and GitHub Release publication.'
+    Assert-True $publishScript.Contains('write_output("acceptance", "not-attempted")') 'The NuGet pivot no longer distinguishes a skipped attempt from an ambiguous response.'
+    Assert-True $publishScript.Contains('write_output("acceptance", "ambiguous")') 'The NuGet pivot no longer fails safe before its first network attempt.'
+    Assert-True $publishScript.Contains('write_output("acceptance", "accepted")') 'The NuGet pivot no longer records confirmed client success.'
+    Assert-True $recoveryStep.Contains('always() && failure() &&') 'The recovery upload no longer runs after a failed NuGet client step.'
+    Assert-True $recoveryStep.Contains('steps.nuget_publish.outputs.recovery_required == ''true''') 'The recovery upload is not guarded by the publish attempt state.'
     Assert-True $recoveryStep.Contains('artifacts/release-recovery.bundle') 'The recovery artifact no longer contains the local release commit and tag.'
     Assert-True $recoveryStep.Contains('artifacts/*.nupkg') 'The recovery artifact no longer contains the exact published package.'
     Assert-True $recoveryStep.Contains('artifacts/*.snupkg') 'The recovery artifact no longer contains the exact symbol package.'
@@ -308,6 +316,45 @@ try {
         Assert-True $guidance.Contains('release-recovery-vX.Y.Z') 'Shipped release guidance must direct post-pivot recovery to the immutable recovery artifact.'
     }
     Assert-True $workflow.Contains('Once NuGet accepts the package,') 'The workflow header must prohibit rebuilding as soon as the package is accepted.'
+
+    $ambiguousCase = Join-Path $tempRoot 'ambiguous-publish'
+    [IO.Directory]::CreateDirectory($ambiguousCase) | Out-Null
+    $publishOutputPath = Join-Path $ambiguousCase 'github-output.txt'
+    $acceptedMarkerPath = Join-Path $ambiguousCase 'server-accepted.txt'
+    $publishPrelude = @'
+import os
+import subprocess
+import time
+
+def accepted_but_client_failed(command, check=False):
+    with open(os.environ["ACCEPTED_MARKER"], "a", encoding="utf-8") as marker:
+        marker.write("accepted\n")
+    return subprocess.CompletedProcess(command, 1)
+
+subprocess.run = accepted_but_client_failed
+time.sleep = lambda seconds: None
+'@
+    $ambiguousFailure = Invoke-PythonBlock `
+        -WorkingDirectory $ambiguousCase `
+        -ScriptName 'publish-ambiguous.py' `
+        -Script $publishScript `
+        -Prelude "$publishPrelude`n" `
+        -Environment @{
+            ACCEPTED_MARKER = $acceptedMarkerPath
+            GITHUB_OUTPUT = $publishOutputPath
+            NUGET_API_KEY = 'test-key-not-a-secret'
+        } `
+        -ExpectFailure
+    $publishOutputs = @{}
+    foreach ($line in [IO.File]::ReadAllLines($publishOutputPath)) {
+        $parts = $line.Split('=', 2)
+        $publishOutputs[$parts[0]] = $parts[1]
+    }
+    Assert-Equal 'ambiguous' $publishOutputs['acceptance'] 'A terminal client failure after server acceptance was not classified as ambiguous.'
+    Assert-Equal 'true' $publishOutputs['recovery_required'] 'An ambiguous accepted publish did not require preservation of the exact recovery state.'
+    Assert-Equal 3 ([IO.File]::ReadAllLines($acceptedMarkerPath).Length) 'The ambiguous publish regression did not execute all retry attempts.'
+    Assert-True $ambiguousFailure.Contains('NuGet acceptance is ambiguous') 'The ambiguous publish failure omitted the fail-safe operator diagnostic.'
+    Write-Host 'PASS ambiguous-publish-preserves-recovery'
 
     $firstRelease = Invoke-ReleaseStateCase `
         -Name 'first-release' `

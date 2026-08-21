@@ -389,8 +389,9 @@ jobs:
       # only if NuGet did not accept the package.
       # `--skip-duplicate` exits 0 when this exact version already exists on
       # nuget.org (HTTP 409), so an in-step retry remains safe if the registry
-      # accepted a previous attempt but its response was lost. The loop retries
-      # only transient failures (network, registry blips).
+      # accepted a previous attempt but its response was lost. If every client
+      # attempt fails, acceptance is ambiguous: the final step preserves this
+      # run's exact recovery state before the job terminates.
       #
       # MORE SECURE ALTERNATIVE — NuGet Trusted Publishing (OIDC): instead of a
       # long-lived NUGET_API_KEY secret, mint a short-lived key per run. Add
@@ -404,21 +405,47 @@ jobs:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
           set -euo pipefail
-          for attempt in 1 2 3; do
-            if dotnet nuget push "./artifacts/*.nupkg" \
-                 --source "https://api.nuget.org/v3/index.json" \
-                 --api-key "$NUGET_API_KEY" \
-                 --skip-duplicate; then
-              echo "NuGet push succeeded (attempt $attempt)."
-              exit 0
-            fi
-            echo "::warning::NuGet push attempt $attempt failed; retrying after backoff..."
-            sleep $((attempt * 15))
-          done
-          echo "::error::NuGet push failed after 3 attempts. No VCS push or GitHub Release was attempted."
-          echo "::error::Before re-running, confirm this version is absent on nuget.org."
-          echo "::error::If NuGet accepted it, do not re-run or rebuild."
-          exit 1
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import time
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+
+          def write_output(name, value):
+              with output_path.open("a", encoding="utf-8") as output:
+                  output.write(f"{name}={value}\n")
+
+          write_output("acceptance", "not-attempted")
+          write_output("recovery_required", "false")
+
+          command = [
+              "dotnet", "nuget", "push", "./artifacts/*.nupkg",
+              "--source", "https://api.nuget.org/v3/index.json",
+              "--api-key", os.environ["NUGET_API_KEY"],
+              "--skip-duplicate",
+          ]
+          for attempt in range(1, 4):
+              if attempt == 1:
+                  # A failed client response cannot prove that the server rejected
+                  # the immutable package bytes, so fail safe from the first attempt.
+                  write_output("acceptance", "ambiguous")
+                  write_output("recovery_required", "true")
+              if subprocess.run(command, check=False).returncode == 0:
+                  write_output("acceptance", "accepted")
+                  print(f"NuGet push succeeded (attempt {attempt}).")
+                  sys.exit(0)
+              print(f"::warning::NuGet push attempt {attempt} failed; retrying after backoff...")
+              time.sleep(attempt * 15)
+
+          print("::error::NuGet push failed after 3 attempts. No VCS push or GitHub Release was attempted.")
+          print("::error::NuGet acceptance is ambiguous; the exact recovery state will be preserved by the final step.")
+          print("::error::Do not re-run or rebuild unless the version is confirmed absent on nuget.org.")
+          print("::error::If NuGet accepted it, recover only from this run's immutable artifact.")
+          sys.exit(1)
+          PY
 
       # Reversible VCS write, AFTER the pivot. --atomic guarantees the branch and
       # tag move together (or neither does), so we never advance main while losing
@@ -487,12 +514,17 @@ jobs:
           echo "::error::If it exists: '$edit_command && $upload_command'."
           exit 1
 
-      # Runs only after NuGet accepted the package and a later step failed. Persist
-      # the exact package, notes, checksums, and local release commit/tag so recovery
-      # never rebuilds or substitutes post-pivot artifacts. Nothing is uploaded when
-      # the publish itself fails, preserving the no-trace pre-pivot guarantee.
+      # Runs after an accepted publish followed by a later failure, or after an
+      # attempted publish whose terminal client failure leaves acceptance ambiguous.
+      # Persist the exact package, notes, checksums, and local release commit/tag so
+      # recovery never rebuilds or substitutes post-pivot artifacts. Failures before
+      # the first publish attempt leave recovery-required false (or the step skipped).
       - name: Preserve exact post-pivot recovery state
-        if: ${{ failure() && steps.nuget_publish.outcome == 'success' }}
+        if: >-
+          ${{
+            always() && failure() &&
+            steps.nuget_publish.outputs.recovery_required == 'true'
+          }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-recovery-${{ steps.version.outputs.tag }}

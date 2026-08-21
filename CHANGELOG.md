@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.yamllint.yml` config (tuned for GitHub Actions) and a CI `yaml-lint` job that lints workflow YAML.
 
 ### Changed
-- Release workflow makes NuGet publication the irreversible pivot: re-run only when NuGet did not accept the package; after acceptance, recover the exact package, tag, checksums, and notes from the immutable run artifact.
+- Release workflow makes NuGet publication the irreversible pivot: terminal client failures preserve the exact recovery state, re-run is allowed only after confirming non-acceptance, and accepted packages recover from the immutable run artifact.
 - All GitHub Actions are pinned to a commit SHA (with a version comment) instead of a moving tag; Dependabot now groups action bumps into a single weekly PR.
 
 ### Fixed
