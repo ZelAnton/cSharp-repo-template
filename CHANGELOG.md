@@ -14,11 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.yamllint.yml` config (tuned for GitHub Actions) and a CI `yaml-lint` job that lints workflow YAML.
 
 ### Changed
-- Release workflow makes the NuGet publish the single irreversible pivot: build, test, pack and a **local** commit/tag run before it, and the commit/tag are pushed to `main` (plus the GitHub Release created) only **after** a successful publish — so any failure up to and including the publish leaves no remote or registry trace and is safe to re-run.
+- Release workflow makes NuGet publication the irreversible pivot: confirmed terminal rejections leave no remote trace, while ambiguous failures, timeouts, and cancellations preserve the exact immutable recovery state.
 - All GitHub Actions are pinned to a commit SHA (with a version comment) instead of a moving tag; Dependabot now groups action bumps into a single weekly PR.
 
 ### Fixed
 - First-release changelog auto-fill now includes release-worthy changes from the repository's root commit.
+- NuGet packages now contain the same versioned changelog state used for release notes and the release tag.
 - Template initialization now rejects unsafe multiline or repository-owner metadata and preserves quoted, metacharacter-rich, or placeholder-like values without cascading replacements or release-workflow injection.
 - Linux container tests now pass filter expressions as literal arguments instead of allowing Bash to interpret filter text.
 - PowerShell template initialization now falls back to placeholder author details when Git or its configured identity is unavailable.
