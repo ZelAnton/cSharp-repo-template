@@ -325,6 +325,8 @@ try {
     Assert-True $publishScript.Contains('write_output("acceptance", "ambiguous")') 'The NuGet pivot no longer fails safe before its first network attempt.'
     Assert-True $publishScript.Contains('write_output("acceptance", "accepted")') 'The NuGet pivot no longer records confirmed client success.'
     Assert-True $publishScript.Contains('write_output("acceptance", "rejected")') 'The NuGet pivot no longer records a confirmed terminal rejection.'
+    Assert-True $publishScript.Contains('write_output("acceptance", "pre-existing")') 'The NuGet pivot no longer distinguishes a first-attempt duplicate from this run''s accepted package.'
+    Assert-True $publishScript.Contains('if attempt > 1:') 'Duplicate idempotence is no longer limited to retries after this process has attempted the package.'
     Assert-True $publishScript.Contains('timeout=300') 'The NuGet client attempt is no longer bounded before the job-level timeout.'
     Assert-True $publishScript.Contains('"./artifacts/*.nupkg"') 'The NuGet pivot no longer publishes the main package explicitly.'
     Assert-True $publishScript.Contains('"./artifacts/*.snupkg"') 'The NuGet pivot no longer publishes the symbol package explicitly.'
@@ -391,6 +393,91 @@ time.sleep = lambda seconds: None
     Assert-RecoveryGuard 'failure' $rejectedOutputs $rejectedRecoveryMarker $false 'A confirmed rejection would create a remote recovery trace.'
     Assert-True $rejectedFailure.Contains('NuGet conclusively rejected the package') 'Confirmed rejection omitted the no-trace operator diagnostic.'
     Write-Host 'PASS confirmed-rejection-leaves-no-recovery-trace'
+
+    $preExistingCase = Join-Path $tempRoot 'first-attempt-duplicate'
+    [IO.Directory]::CreateDirectory((Join-Path $preExistingCase 'artifacts')) | Out-Null
+    $preExistingOutputPath = Join-Path $preExistingCase 'github-output.txt'
+    $preExistingAttemptPath = Join-Path $preExistingCase 'attempted.txt'
+    $preExistingRecoveryMarker = Join-Path $preExistingCase 'artifacts/.nuget-recovery-required'
+    $preExistingPrelude = @'
+import os
+import subprocess
+import time
+
+def first_attempt_duplicate(command, **kwargs):
+    with open(os.environ["ATTEMPT_MARKER"], "a", encoding="utf-8") as marker:
+        marker.write(f"skip-duplicate={'--skip-duplicate' in command}\n")
+    return subprocess.CompletedProcess(
+        command,
+        1,
+        stdout="",
+        stderr="error: Response status code does not indicate success: 409 (Conflict).\n",
+    )
+
+subprocess.run = first_attempt_duplicate
+time.sleep = lambda seconds: None
+'@
+    $preExistingFailure = Invoke-PythonBlock `
+        -WorkingDirectory $preExistingCase `
+        -ScriptName 'publish-first-attempt-duplicate.py' `
+        -Script $publishScript `
+        -Prelude "$preExistingPrelude`n" `
+        -Environment @{
+            ATTEMPT_MARKER = $preExistingAttemptPath
+            GITHUB_OUTPUT = $preExistingOutputPath
+            NUGET_API_KEY = 'test-key-not-a-secret'
+        } `
+        -ExpectFailure
+    $preExistingOutputs = Read-GitHubOutputs $preExistingOutputPath
+    Assert-Equal 'pre-existing' $preExistingOutputs['acceptance'] 'A first-attempt duplicate was falsely accepted as this run''s package.'
+    Assert-Equal 'false' $preExistingOutputs['recovery_required'] 'A first-attempt duplicate falsely marked this run''s recovery bundle as exact.'
+    Assert-Equal 'skip-duplicate=False' (([IO.File]::ReadAllLines($preExistingAttemptPath)) -join '|') 'The first package attempt used duplicate-skipping or was retried.'
+    Assert-False (Test-Path -LiteralPath $preExistingRecoveryMarker) 'A first-attempt duplicate left an exact-recovery marker behind.'
+    Assert-RecoveryGuard 'failure' $preExistingOutputs $preExistingRecoveryMarker $false 'A first-attempt duplicate would upload mismatched release state.'
+    Assert-True $preExistingFailure.Contains('existed before the current run') 'First-attempt duplicate omitted its fail-closed operator diagnostic.'
+    Write-Host 'PASS first-attempt-duplicate-fails-closed'
+
+    $retryDuplicateCase = Join-Path $tempRoot 'duplicate-after-ambiguous-attempt'
+    [IO.Directory]::CreateDirectory((Join-Path $retryDuplicateCase 'artifacts')) | Out-Null
+    $retryDuplicateOutputPath = Join-Path $retryDuplicateCase 'github-output.txt'
+    $retryDuplicateAttemptPath = Join-Path $retryDuplicateCase 'attempted.txt'
+    $retryDuplicatePrelude = @'
+import os
+import subprocess
+import time
+
+call_count = 0
+
+def duplicate_after_ambiguous_attempt(command, **kwargs):
+    global call_count
+    target = command[3]
+    if target == "./artifacts/*.snupkg":
+        return subprocess.CompletedProcess(command, 0, stdout="symbols accepted\n", stderr="")
+    call_count += 1
+    with open(os.environ["ATTEMPT_MARKER"], "a", encoding="utf-8") as marker:
+        marker.write(f"attempt={call_count};skip-duplicate={'--skip-duplicate' in command}\n")
+    if call_count == 1:
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="connection reset\n")
+    return subprocess.CompletedProcess(command, 0, stdout="already exists; skipping duplicate\n", stderr="")
+
+subprocess.run = duplicate_after_ambiguous_attempt
+time.sleep = lambda seconds: None
+'@
+    [void](Invoke-PythonBlock `
+        -WorkingDirectory $retryDuplicateCase `
+        -ScriptName 'publish-retry-duplicate.py' `
+        -Script $publishScript `
+        -Prelude "$retryDuplicatePrelude`n" `
+        -Environment @{
+            ATTEMPT_MARKER = $retryDuplicateAttemptPath
+            GITHUB_OUTPUT = $retryDuplicateOutputPath
+            NUGET_API_KEY = 'test-key-not-a-secret'
+        })
+    $retryDuplicateOutputs = Read-GitHubOutputs $retryDuplicateOutputPath
+    Assert-Equal 'accepted' $retryDuplicateOutputs['acceptance'] 'A duplicate linked to this process''s ambiguous attempt did not preserve retry idempotence.'
+    Assert-Equal 'true' $retryDuplicateOutputs['recovery_required'] 'A successful post-attempt duplicate lost the post-pivot recovery state.'
+    Assert-Equal 'attempt=1;skip-duplicate=False|attempt=2;skip-duplicate=True' (([IO.File]::ReadAllLines($retryDuplicateAttemptPath)) -join '|') 'Duplicate-skipping was not confined to the retry after an ambiguous attempt.'
+    Write-Host 'PASS duplicate-after-ambiguous-attempt-is-idempotent'
 
     $partialCase = Join-Path $tempRoot 'package-accepted-symbol-rejected'
     [IO.Directory]::CreateDirectory((Join-Path $partialCase 'artifacts')) | Out-Null

@@ -389,12 +389,14 @@ jobs:
       # around it. It runs BEFORE the git push and the GitHub Release: if it fails,
       # no tag/commit has reached the remote and no Release exists. A new run is safe
       # only if NuGet did not accept the package.
-      # `--skip-duplicate` exits 0 when this exact version already exists on
-      # nuget.org (HTTP 409), so an in-step retry remains safe if the registry
-      # accepted a previous attempt but its response was lost. An English,
-      # structured terminal 400/401/403/413/415/422 response on the first attempt
-      # proves rejection and leaves no remote recovery artifact. Every other failed,
-      # timed-out, or cancelled attempt remains ambiguous, so the final step
+      # The first attempt never uses `--skip-duplicate`: a 409 there proves that the
+      # version predates this run, so the workflow fails closed without publishing
+      # this run's tag, Release, checksums, notes, or recovery bundle. Only an in-step
+      # retry after an ambiguous attempt uses `--skip-duplicate`, preserving retry
+      # idempotence when the registry accepted that attempt but its response was lost.
+      # An English, structured terminal 400/401/403/413/415/422 response on the first
+      # attempt proves rejection and leaves no remote recovery artifact. Every other
+      # failed, timed-out, or cancelled attempt remains ambiguous, so the final step
       # preserves this run's exact recovery state before the job terminates.
       #
       # MORE SECURE ALTERNATIVE — NuGet Trusted Publishing (OIDC): instead of a
@@ -422,6 +424,11 @@ jobs:
           confirmed_rejection = re.compile(
               r"Response status code does not indicate success:\s*"
               r"(?:400|401|403|413|415|422)\b",
+              re.IGNORECASE,
+          )
+          pre_existing_version = re.compile(
+              r"(?:Response status code does not indicate success:\s*409\b|"
+              r"package version already exists)",
               re.IGNORECASE,
           )
 
@@ -454,7 +461,6 @@ jobs:
               "dotnet", "nuget", "push", "./artifacts/*.nupkg",
               "--source", "https://api.nuget.org/v3/index.json",
               "--api-key", os.environ["NUGET_API_KEY"],
-              "--skip-duplicate",
               "--no-symbols",
               "--force-english-output",
           ]
@@ -465,9 +471,14 @@ jobs:
                   # the runner cannot finalize step outputs.
                   write_output("acceptance", "ambiguous")
                   require_recovery(True)
+              attempt_command = package_command
+              if attempt > 1:
+                  # A duplicate is safe only after this process has made an
+                  # acceptance-ambiguous attempt for the same local package.
+                  attempt_command = [*package_command, "--skip-duplicate"]
               try:
                   result = subprocess.run(
-                      package_command,
+                      attempt_command,
                       check=False,
                       capture_output=True,
                       text=True,
@@ -489,6 +500,19 @@ jobs:
                   break
 
               response = f"{result.stdout or ''}\n{result.stderr or ''}"
+              if attempt == 1 and pre_existing_version.search(response):
+                  write_output("acceptance", "pre-existing")
+                  require_recovery(False)
+                  print(
+                      "::error::This NuGet version existed before the current run; "
+                      "the current artifacts were not accepted as this release."
+                  )
+                  print(
+                      "::error::No VCS push, GitHub Release, checksum publication, "
+                      "or exact-recovery artifact will be created."
+                  )
+                  sys.exit(1)
+
               if attempt == 1 and confirmed_rejection.search(response):
                   write_output("acceptance", "rejected")
                   require_recovery(False)
