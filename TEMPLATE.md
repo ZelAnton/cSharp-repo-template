@@ -26,10 +26,11 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    bash ./scripts/check-env.sh
    ```
 
-   It checks for the .NET SDK (the major band pinned in `global.json`). If
-   anything required is missing it lists the install commands for your OS and
-   exits non-zero — install what it names, then re-run it. **Don't run init until
-   it reports the environment is ready.**
+   It asks the .NET host to resolve the committed `global.json`, including its
+   exact `version`, `rollForward`, and `allowPrerelease` settings. If the file is
+   invalid or no compatible SDK is installed, it names the configuration file,
+   lists install guidance, and exits non-zero. **Don't run init until it reports
+   the environment is ready.**
 3. Run the init script once to stamp your project name in. Use whichever
    matches your shell — both do the same thing:
 
@@ -128,10 +129,11 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
   `docs/linux-testing.md` if you don't need to run the Linux code path locally.
 - **Rider settings** — delete `__ProjectName__.sln.DotSettings` if you don't use
   Rider/ReSharper.
-- **SDK pin** — `global.json` pins the .NET SDK feature band (10.0.1xx and up via
-  `rollForward: latestFeature`) so builds are reproducible and a contributor on an
-  older SDK gets a clear error instead of confusing analyzer failures. Bump it when
-  you move to a newer band; delete it to always use whatever SDK is installed.
+- **SDK pin** — `global.json` starts at 10.0.100 and selects the latest installed
+  .NET 10 feature band via `rollForward: latestFeature`; it does not cross into a
+  later major or accept prerelease SDKs. The environment checks use the .NET host
+  itself to enforce those settings. Bump the file when you move to a newer band;
+  delete it to always use whatever SDK is installed.
 - **Dependency updates** — `.github/dependabot.yml` opens weekly PRs to bump GitHub
   Actions and the central NuGet versions in `Directory.Packages.props`. Action and
   NuGet bumps are each grouped into a single weekly PR. Remove it if you update

@@ -19,5 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Template initialization now rejects unsafe multiline or repository-owner metadata and preserves quoted, metacharacter-rich, or placeholder-like values without cascading replacements or release-workflow injection.
+- Environment preflight now uses the .NET host's complete `global.json` resolution rules and reports invalid configuration instead of accepting incompatible SDKs.
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main

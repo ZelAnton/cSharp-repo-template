@@ -5,10 +5,10 @@
     initialize the template.
 
 .DESCRIPTION
-    Verifies the .NET SDK is installed and new enough (the major band pinned in
-    global.json). Prints "Environment ready" and exits 0 on success; if a required
-    tool is missing it prints per-OS install commands and exits 1 — install what it
-    names, then re-run.
+    Asks the .NET host to resolve the SDK configuration pinned in global.json.
+    Prints "Environment ready" and exits 0 on success; if a required tool is
+    missing or the SDK configuration cannot be resolved, it prints per-OS install
+    commands and exits 1 — install what it names, then re-run.
 
     Run it first, before scripts/init.ps1:
 
@@ -22,30 +22,34 @@ $problems = @()
 
 Write-Host "==> Checking environment for C# (.NET) development" -ForegroundColor Cyan
 
-# Required .NET major version — read from global.json when present, else default.
-$requiredMajor = 10
-$globalJson = Join-Path (Join-Path $PSScriptRoot '..') 'global.json'
-if (Test-Path $globalJson) {
-    try {
-        $v = (Get-Content -Raw $globalJson | ConvertFrom-Json).sdk.version
-        if ($v -match '^(\d+)\.') { $requiredMajor = [int]$Matches[1] }
-    } catch {
-        # global.json unreadable/edited - fall back to the default major above.
-    }
-}
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$globalJson = Join-Path $repoRoot 'global.json'
 
 # Required: the .NET SDK (it bundles the C# compiler and `dotnet test`).
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     $problems += "the .NET SDK ('dotnet' is not on PATH)"
 } else {
-    $haveMajor = $false
-    foreach ($line in (& dotnet --list-sdks)) {
-        if ($line -match '^(\d+)\.' -and [int]$Matches[1] -ge $requiredMajor) { $haveMajor = $true }
+    Push-Location $repoRoot
+    $nativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    try {
+        $PSNativeCommandUseErrorActionPreference = $false
+        $sdkOutput = @(& dotnet --version 2>&1)
+        $sdkExitCode = $LASTEXITCODE
     }
-    if ($haveMajor) {
-        Write-Host "    .NET SDK $requiredMajor+ found" -ForegroundColor DarkGray
-    } else {
-        $problems += "a .NET $requiredMajor SDK (dotnet found, but no installed SDK >= $requiredMajor)"
+    finally {
+        $PSNativeCommandUseErrorActionPreference = $nativeErrorPreference
+        Pop-Location
+    }
+
+    if ($sdkExitCode -eq 0 -and $sdkOutput.Count -gt 0) {
+        $resolvedSdk = [string]$sdkOutput[-1]
+        Write-Host "    .NET SDK $resolvedSdk resolved from global.json" -ForegroundColor DarkGray
+    }
+    else {
+        $problems += "the SDK configuration in '$globalJson' could not be resolved by dotnet"
+        foreach ($line in $sdkOutput) {
+            Write-Host "    $line" -ForegroundColor DarkGray
+        }
     }
 }
 
@@ -64,8 +68,8 @@ Write-Host ""
 Write-Host "Environment NOT ready. Missing:" -ForegroundColor Red
 foreach ($p in $problems) { Write-Host "  - $p" -ForegroundColor Red }
 Write-Host ""
-Write-Host "Install the .NET $requiredMajor SDK, then re-run this check:" -ForegroundColor Yellow
-Write-Host "  Windows : winget install Microsoft.DotNet.SDK.$requiredMajor"
+Write-Host "Install an SDK compatible with $globalJson, then re-run this check:" -ForegroundColor Yellow
+Write-Host "  Windows : winget install Microsoft.DotNet.SDK.10"
 Write-Host "  macOS   : brew install --cask dotnet-sdk"
 Write-Host "  Linux   : see https://learn.microsoft.com/dotnet/core/install/linux"
 exit 1
