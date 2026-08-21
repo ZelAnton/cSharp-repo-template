@@ -4,7 +4,8 @@ Thanks for your interest in improving **__ProjectName__**.
 
 ## Prerequisites
 
-- .NET 10 SDK (the exact band is pinned in [`global.json`](global.json)).
+- A .NET SDK accepted by [`global.json`](global.json): 10.0.100 or a later .NET
+  10 feature band, excluding prerelease SDKs.
 - Optional: PowerShell 7+ and Docker/Rancher Desktop to run the Linux test
   helper (`scripts/test-linux.ps1`).
 

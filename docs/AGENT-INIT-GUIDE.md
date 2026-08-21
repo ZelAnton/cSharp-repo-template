@@ -16,9 +16,11 @@ have gone wrong in avoidable ways. **Read it before touching any files.**
 1. **Read before you write.** Read `TEMPLATE.md`, this file, `AGENTS.md`, and
    `CLAUDE.md` *first*. Do not generate a single file based on an assumed layout.
 2. **Check the toolchain first.** Run `scripts/check-env.ps1` (or
-   `scripts/check-env.sh`). If it reports a missing tool, STOP and offer the user
-   the install commands it prints — don't run init against an environment that
-   can't build or test.
+   `scripts/check-env.sh`). The check delegates SDK selection to the .NET host, so
+   an invalid `global.json` or an installed SDK outside its `version`,
+   `rollForward`, and `allowPrerelease` policy is a failure. If it reports a
+   problem, STOP and offer the user the install guidance it prints — don't run
+   init against an environment that can't build or test.
 3. **Prefer the init script over hand-rolling.** `scripts/init.ps1` is the
    supported path for a standard single-project init. Run it; don't recreate its
    work by hand.
