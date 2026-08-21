@@ -64,12 +64,43 @@ if ($ProjectName -notmatch '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'
     throw "Invalid -ProjectName '$ProjectName'. Use letters, digits, underscores; dot-separated segments allowed (e.g. Acme.Widgets)."
 }
 
+function Get-GitConfigValue(
+    [Management.Automation.ApplicationInfo]$gitCommand,
+    [string]$key
+) {
+    if (-not $gitCommand) {
+        return $null
+    }
+
+    $nativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+    try {
+        $PSNativeCommandUseErrorActionPreference = $false
+        [string]$value = & $gitCommand.Source config --get $key 2>$null
+        if ($LASTEXITCODE -eq 0 -and $value) {
+            return $value
+        }
+    }
+    catch {
+        # Git-backed defaults are optional; an unavailable or broken executable falls back to placeholders.
+    }
+    finally {
+        $PSNativeCommandUseErrorActionPreference = $nativeErrorPreference
+    }
+
+    return $null
+}
+
+$gitCommand = if (-not $Author -or -not $AuthorEmail) {
+    @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue)[0]
+} else {
+    $null
+}
 if (-not $Author) {
-    $Author = (& git config user.name 2>$null)
+    $Author = Get-GitConfigValue $gitCommand 'user.name'
     if (-not $Author) { $Author = 'Your Name' }
 }
 if (-not $AuthorEmail) {
-    $AuthorEmail = (& git config user.email 2>$null)
+    $AuthorEmail = Get-GitConfigValue $gitCommand 'user.email'
     if (-not $AuthorEmail) { $AuthorEmail = 'you@example.com' }
 }
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }

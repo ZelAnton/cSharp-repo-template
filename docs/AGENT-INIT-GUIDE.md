@@ -73,9 +73,12 @@ assumptions a past agent got wrong:
    pwsh ./scripts/init.ps1 -ProjectName Acme.Widgets -Author "Jane Doe" -GitHubOwner acme -Description "Widget toolkit"
    ```
 
-   `-ProjectName` is required; the rest fall back to sensible defaults. Author,
-   author email, and description must be single-line; GitHub owner must be 1-39
-   letters, digits, or hyphens with no leading or trailing hyphen. Quotes,
+   `-ProjectName` is required; the rest fall back to sensible defaults. The
+   PowerShell initializer reads author and email from Git when available, then
+   uses `Your Name` and `you@example.com` when Git or either configured value is
+   unavailable. Author, author email, and description must be single-line;
+   GitHub owner must be 1-39 letters, digits, or hyphens with no leading or
+   trailing hyphen. Quotes,
    backslashes, shell/Python metacharacters, and placeholder-like text are safe:
    replacement is one pass, XML destinations are escaped, and the workflow
    identity is serialized before Bash receives it. Validation happens before any

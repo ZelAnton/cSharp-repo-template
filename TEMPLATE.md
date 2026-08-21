@@ -44,7 +44,9 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 
    `-ProjectName` / `--project-name` is required; the rest are optional and fall
    back to sensible defaults (`git config user.name`, `git config user.email`,
-   `your-org`, a TODO description, the current year). The script:
+   `your-org`, a TODO description, the current year). If Git is unavailable or
+   either configured identity value is empty, the PowerShell initializer uses
+   `Your Name` and `you@example.com` instead. The script:
    - validates all metadata before writing: author, author email, and description
      must be single-line; GitHub owner must be 1-39 letters, digits, or hyphens,
      with no leading or trailing hyphen;
