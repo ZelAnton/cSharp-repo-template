@@ -227,72 +227,6 @@ jobs:
           print("--------------------------------------------")
           PY
 
-      - name: Extract release notes from CHANGELOG.md
-        run: |
-          set -euo pipefail
-          python3 <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          text = pathlib.Path("CHANGELOG.md").read_text()
-          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
-          body = (m.group(1) if m else "").strip()
-
-          # Keep "### Header" only if it has at least one real bullet ("- text").
-          # Drop placeholder "-" lines and empty sections so notes are clean.
-          parts = re.split(r"(?m)(^### .+$)", body)
-          out = []
-          for i in range(1, len(parts), 2):
-              header = parts[i]
-              section = parts[i + 1] if i + 1 < len(parts) else ""
-              bullets = [ln for ln in section.splitlines() if re.match(r"^-\s+\S", ln)]
-              if bullets:
-                  if out:
-                      out.append("")
-                  out.append(header)
-                  out.extend(bullets)
-
-          result = "\n".join(out).strip()
-          if not result:
-              print(
-                  "::error::[Unreleased] section in CHANGELOG.md is empty. "
-                  "Add release notes before releasing.",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          pathlib.Path("release-notes.md").write_text(result + "\n")
-          print("----- release-notes.md -----")
-          print(result)
-          print("----------------------------")
-          PY
-
-      - name: Restore
-        run: dotnet restore
-
-      - name: Build
-        run: dotnet build --no-restore --configuration Release /p:Version=${{ steps.version.outputs.version }}
-
-      - name: Test
-        run: dotnet test --no-build --configuration Release
-
-      - name: Pack
-        run: dotnet pack src/__ProjectName__/__ProjectName__.csproj --no-build --configuration Release --output ./artifacts /p:Version=${{ steps.version.outputs.version }}
-
-      - name: Generate SHA256SUMS
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          cd ./artifacts
-          files=(*.nupkg *.snupkg)
-          if [[ ${#files[@]} -eq 0 ]]; then
-            echo "::error::No package files to hash in ./artifacts."
-            exit 1
-          fi
-          sha256sum "${files[@]}" > SHA256SUMS
-          cat SHA256SUMS
-
       - name: Bump version in csproj
         run: sed -i -E "s|<Version>[^<]+</Version>|<Version>${{ steps.version.outputs.version }}</Version>|" src/__ProjectName__/__ProjectName__.csproj
 
@@ -343,6 +277,79 @@ jobs:
           path.write_text(text)
           PY
 
+      - name: Extract release notes from release section
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          version = os.environ["VERSION"]
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          m = re.search(
+              rf"^## \[{re.escape(version)}\](?:\s+-\s+[^\n]+)?\s*\n(.*?)(?=^## \[|\Z)",
+              text,
+              re.M | re.S,
+          )
+          body = (m.group(1) if m else "").strip()
+
+          # Keep "### Header" only if it has at least one real bullet ("- text").
+          # Drop placeholder "-" lines and empty sections so notes are clean.
+          parts = re.split(r"(?m)(^### .+$)", body)
+          out = []
+          for i in range(1, len(parts), 2):
+              header = parts[i]
+              section = parts[i + 1] if i + 1 < len(parts) else ""
+              bullets = [ln for ln in section.splitlines() if re.match(r"^-\s+\S", ln)]
+              if bullets:
+                  if out:
+                      out.append("")
+                  out.append(header)
+                  out.extend(bullets)
+
+          result = "\n".join(out).strip()
+          if not result:
+              print(
+                  f"::error::Release section [{version}] in CHANGELOG.md is missing or empty.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          pathlib.Path("release-notes.md").write_text(result + "\n")
+          print("----- release-notes.md -----")
+          print(result)
+          print("----------------------------")
+          PY
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release /p:Version=${{ steps.version.outputs.version }}
+
+      - name: Test
+        run: dotnet test --no-build --configuration Release
+
+      - name: Pack
+        run: dotnet pack src/__ProjectName__/__ProjectName__.csproj --no-build --configuration Release --output ./artifacts /p:Version=${{ steps.version.outputs.version }}
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd ./artifacts
+          files=(*.nupkg *.snupkg)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::No package files to hash in ./artifacts."
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
       # Create the release commit and tag LOCALLY, but do NOT push yet: the push is
       # a VCS write and must happen AFTER the irreversible NuGet publish (the pivot
       # below). Keeping it local means a failure before/at publish leaves nothing on
@@ -361,6 +368,18 @@ jobs:
           git commit -m "Release ${{ steps.version.outputs.tag }}"
           git tag "${{ steps.version.outputs.tag }}"
 
+      # Keep the exact local release commit/tag available for post-pivot recovery.
+      # The bundle stays on the ephemeral runner unless a later post-publish step
+      # fails, in which case the final recovery step uploads it with the exact
+      # packages and notes produced above.
+      - name: Create local release recovery bundle
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git bundle create ./artifacts/release-recovery.bundle HEAD "$TAG"
+          git bundle verify ./artifacts/release-recovery.bundle
+
       # === PIVOT: the single irreversible step ===
       # NuGet publishing cannot be undone (a pushed version can only be unlisted,
       # never re-pushed), so it is the pivot and every reversible action is ordered
@@ -368,10 +387,9 @@ jobs:
       # no tag/commit has reached the remote and no Release exists, so a re-run is
       # safe and recomputes the SAME version (the latest tag has not moved).
       # `--skip-duplicate` exits 0 when this exact version already exists on
-      # nuget.org (HTTP 409) — that is NuGet's own, version-scoped "already
-      # published == success" signal, so a re-run after a post-publish failure
-      # sails through instead of erroring. The loop retries only transient failures
-      # (network, registry blips).
+      # nuget.org (HTTP 409), so an in-step retry remains safe if the registry
+      # accepted a previous attempt but its response was lost. The loop retries
+      # only transient failures (network, registry blips).
       #
       # MORE SECURE ALTERNATIVE — NuGet Trusted Publishing (OIDC): instead of a
       # long-lived NUGET_API_KEY secret, mint a short-lived key per run. Add
@@ -380,6 +398,7 @@ jobs:
       # the `NuGet/login` action to obtain a temporary key (and update the preflight
       # step accordingly). See https://learn.microsoft.com/nuget/nuget-org/trusted-publishing
       - name: Push to NuGet.org (irreversible pivot)
+        id: nuget_publish
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
@@ -401,11 +420,29 @@ jobs:
       # Reversible VCS write, AFTER the pivot. --atomic guarantees the branch and
       # tag move together (or neither does), so we never advance main while losing
       # the tag. If this is rejected (e.g. branch protection — see the checkout
-      # note), the package is already on nuget.org; re-running recomputes the SAME
-      # version (the tag is not yet on the remote) and --skip-duplicate makes the
-      # republish a no-op, so the re-run completes the release.
+      # note), the package is already on nuget.org. Retry here first; after a terminal
+      # failure the final step persists the exact local tag and artifacts for manual
+      # recovery without rebuilding or republishing.
       - name: Push the release commit + tag (atomic)
-        run: git push --atomic origin HEAD:refs/heads/main "${{ steps.version.outputs.tag }}"
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if git push --atomic origin HEAD:refs/heads/main "$TAG"; then
+              echo "Release commit and tag push succeeded (attempt $attempt)."
+              exit 0
+            fi
+            echo "::warning::Atomic release push attempt $attempt failed; retrying after backoff..."
+            sleep $((attempt * 10))
+          done
+          echo "::error::The package is ALREADY on nuget.org, but the release commit and tag were not pushed."
+          echo "::error::Do not rebuild or re-run the whole workflow."
+          echo "::error::Download the release-recovery-$TAG artifact saved by the final step, then run:"
+          echo "::error::git clone ./artifacts/release-recovery.bundle release-recovery"
+          echo "::error::git -C release-recovery remote set-url origin https://github.com/${{ github.repository }}.git"
+          echo "::error::git -C release-recovery push --atomic origin HEAD:refs/heads/main refs/tags/$TAG"
+          exit 1
 
       # Final, recreatable step, made idempotent (edit the Release if it already
       # exists, else create it) and retried. By now the package is published AND the
@@ -436,5 +473,31 @@ jobs:
             echo "::warning::GitHub Release step attempt $attempt failed; retrying after backoff..."
             sleep $((attempt * 10))
           done
-          echo "::error::Failed to create/update the GitHub Release after 3 attempts. The package is ALREADY on nuget.org and the tag is ALREADY on main. Do NOT re-run this workflow (a re-run computes the NEXT version and orphans this release). Finish by hand: if the Release does not exist yet, 'gh release create $TAG --title $TAG --notes-file release-notes.md ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS'; if it already exists (likely, since a partial attempt may have created it), 'gh release edit $TAG --notes-file release-notes.md && gh release upload $TAG ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS --clobber'."
+          create_command="gh release create $TAG --title $TAG --notes-file release-notes.md"
+          create_command+=" ./artifacts/*.nupkg ./artifacts/*.snupkg ./artifacts/SHA256SUMS"
+          edit_command="gh release edit $TAG --notes-file release-notes.md"
+          upload_command="gh release upload $TAG ./artifacts/*.nupkg ./artifacts/*.snupkg"
+          upload_command+=" ./artifacts/SHA256SUMS --clobber"
+          echo "::error::GitHub Release failed after 3 attempts; package and tag are ALREADY published."
+          echo "::error::Do NOT re-run the workflow; it would compute the next version."
+          echo "::error::Download release-recovery-$TAG from this run. If the Release is missing: '$create_command'."
+          echo "::error::If it exists: '$edit_command && $upload_command'."
           exit 1
+
+      # Runs only after NuGet accepted the package and a later step failed. Persist
+      # the exact package, notes, checksums, and local release commit/tag so recovery
+      # never rebuilds or substitutes post-pivot artifacts. Nothing is uploaded when
+      # the publish itself fails, preserving the no-trace pre-pivot guarantee.
+      - name: Preserve exact post-pivot recovery state
+        if: ${{ failure() && steps.nuget_publish.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-recovery-${{ steps.version.outputs.tag }}
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+            artifacts/SHA256SUMS
+            artifacts/release-recovery.bundle
+            release-notes.md
+          if-no-files-found: error
+          retention-days: 30

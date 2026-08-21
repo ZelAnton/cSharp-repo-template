@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - First-release changelog auto-fill now includes release-worthy changes from the repository's root commit.
+- NuGet packages now contain the same versioned changelog state used for release notes and the release tag.
 - Template initialization now rejects unsafe multiline or repository-owner metadata and preserves quoted, metacharacter-rich, or placeholder-like values without cascading replacements or release-workflow injection.
 - Linux container tests now pass filter expressions as literal arguments instead of allowing Bash to interpret filter text.
 - PowerShell template initialization now falls back to placeholder author details when Git or its configured identity is unavailable.

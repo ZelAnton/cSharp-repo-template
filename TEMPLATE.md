@@ -163,11 +163,15 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
   tokens (no stored secret). See the comment above the *Push to NuGet.org* step in
   `.github/workflows/release.yml`.
 - **Release ordering** — the NuGet publish is the single irreversible step, so the
-  workflow makes it the pivot: it builds, tests, packs, and creates a *local*
-  commit+tag first, then publishes, then pushes the commit+tag to `main`. A failure
-  before or at the publish leaves nothing on the remote or registry, so it is safe to
-  re-run; only once the tag is on `main` must you finish a partial release by hand
-  (see `.github/workflows/release.yml`).
+  workflow makes it the pivot. Before packing, it writes the final project version,
+  promotes the Unreleased changelog entries into that version's section, and derives
+  release notes from that section; the package, local commit, and local tag therefore
+  use one release state. It then publishes the package and only after success pushes
+  the commit+tag to `main`. A failure before or at the publish leaves nothing on the
+  remote or registry, so it is safe to re-run. If a later push or GitHub Release step
+  fails, the run uploads the exact packages, notes, checksums, and local release tag as
+  a `release-recovery-vX.Y.Z` artifact; use that artifact instead of rebuilding or
+  re-running the workflow (see `.github/workflows/release.yml`).
 
 ## Recommended add-ons (not enabled by default)
 
