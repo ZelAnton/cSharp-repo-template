@@ -91,9 +91,12 @@ lives.
 
 - The App token is scoped to **Contents: write** and expires automatically — it
   cannot do more than push to the repo, and there is nothing to rotate.
-- The release commit is authored as `__Author__ <__AuthorEmail__>` (the values the
-  workflow's git config uses); the *pusher* is the App. That is expected — the
-  bypass keys on the pusher, not the commit author.
+- The release commit uses the author and email supplied during initialization.
+  Initialization serializes both values before placing them in workflow
+  environment variables, and the workflow decodes them only as quoted `git config`
+  data; quotes, backslashes, and shell metacharacters in the single-line values are
+  not executed. The *pusher* is the App. That is expected — the bypass keys on the
+  pusher, not the commit author.
 - If you would rather not push to `main` at all from CI, the alternative is to drop
   the "Push the release commit + tag" step and open a PR with the release commit
   instead — but then the tag/version bump only lands once that PR merges, which the
