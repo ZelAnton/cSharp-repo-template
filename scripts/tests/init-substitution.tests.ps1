@@ -157,6 +157,93 @@ function Assert-TreesEqual([string]$left, [string]$right) {
     }
 }
 
+function Get-TreeSnapshot([string]$root) {
+    $entries = @()
+    foreach ($directory in Get-ChildItem -LiteralPath $root -Directory -Force -Recurse) {
+        $relative = [IO.Path]::GetRelativePath($root, $directory.FullName).Replace('\', '/')
+        $entries += "D:$relative"
+    }
+    foreach ($file in Get-ChildItem -LiteralPath $root -File -Force -Recurse) {
+        $relative = [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
+        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        $entries += "F:$relative`:$hash"
+    }
+    return @($entries | Sort-Object)
+}
+
+function Add-LocalData([string]$root) {
+    [IO.File]::WriteAllText(
+        (Join-Path $root 'local-__ProjectName__.txt'),
+        "local __ProjectName__ __Author__`n",
+        $utf8NoBom
+    )
+    [IO.File]::WriteAllBytes(
+        (Join-Path $root 'local-asset.bin'),
+        [byte[]](0, 255, 1, 95, 95, 80, 114, 111, 106, 101, 99, 116, 78, 97, 109, 101, 95, 95)
+    )
+
+    foreach ($relative in @('.work', '.cache/packages', 'cache-__ProjectName__', 'src/__ProjectName__/local-data')) {
+        [IO.Directory]::CreateDirectory((Join-Path $root $relative)) | Out-Null
+    }
+    [IO.File]::WriteAllText((Join-Path $root '.work/state.json'), '{"project":"__ProjectName__"}', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $root '.cache/packages/entry.txt'), '__ProjectName__', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $root 'cache-__ProjectName__/entry.txt'), '__ProjectName__', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $root 'src/__ProjectName__/local-data/note.txt'), '__ProjectName__', $utf8NoBom)
+    [IO.File]::WriteAllBytes(
+        (Join-Path $root 'src/__ProjectName__/local-data/payload.bin'),
+        [byte[]](0, 16, 32, 127, 128, 254, 255)
+    )
+}
+
+function Assert-LocalDataPreserved([string]$root, [string]$projectName) {
+    Assert-Equal "local __ProjectName__ __Author__`n" ([IO.File]::ReadAllText((Join-Path $root 'local-__ProjectName__.txt'))) 'Unknown text file was renamed or rewritten.'
+    Assert-Equal '00-FF-01-5F-5F-50-72-6F-6A-65-63-74-4E-61-6D-65-5F-5F' ([BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $root 'local-asset.bin')))) 'Unknown binary file was changed.'
+    Assert-Equal '{"project":"__ProjectName__"}' ([IO.File]::ReadAllText((Join-Path $root '.work/state.json'))) '.work content was changed.'
+    Assert-Equal '__ProjectName__' ([IO.File]::ReadAllText((Join-Path $root '.cache/packages/entry.txt'))) 'Cache content was changed.'
+    Assert-Equal '__ProjectName__' ([IO.File]::ReadAllText((Join-Path $root 'cache-__ProjectName__/entry.txt'))) 'Unknown token-named directory was renamed or rewritten.'
+    Assert-Equal '__ProjectName__' ([IO.File]::ReadAllText((Join-Path $root 'src/__ProjectName__/local-data/note.txt'))) 'Unknown file inside the source template directory moved or changed.'
+    Assert-Equal '00-10-20-7F-80-FE-FF' ([BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $root 'src/__ProjectName__/local-data/payload.bin')))) 'Unknown binary data inside the source template directory moved or changed.'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $root "src/$projectName/local-data"))) 'Unknown source-directory content moved into the generated project.'
+}
+
+function Test-PreflightCollision([string]$initializer, [string]$collision) {
+    $projectName = 'Acme.Collision'
+    $root = Join-Path $tempRoot "collision-$initializer-$collision"
+    Copy-Template $root
+    if ($collision -eq 'settings') {
+        [IO.File]::WriteAllText((Join-Path $root '.claude/settings.json'), '{"local":true}', $utf8NoBom)
+    }
+    else {
+        [IO.File]::WriteAllText((Join-Path $root "$projectName.slnx"), 'local solution', $utf8NoBom)
+    }
+    Add-LocalData $root
+    $before = Get-TreeSnapshot $root
+
+    if ($initializer -eq 'pwsh') {
+        $result = Invoke-Native 'pwsh' @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $projectName,
+            '-Author', 'Collision Author',
+            '-AuthorEmail', 'collision@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Collision preflight regression',
+            '-Year', '2042',
+            '-KeepScript'
+        ) $root -ExpectFailure
+    }
+    else {
+        $result = Invoke-BashInitializer $root $projectName 'Collision Author' 'collision@example.invalid' 'safe-owner' 'Collision preflight regression' '2042' -ExpectFailure
+    }
+
+    $after = Get-TreeSnapshot $root
+    Assert-True ($result.Output -match '(?i)collision') "$initializer did not report the $collision collision clearly."
+    Assert-True ($result.Output -match 'No files were changed') "$initializer did not report the preflight as non-mutating."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the tree after the $collision preflight failure."
+    Assert-True (Test-Path -LiteralPath (Join-Path $root 'src/__ProjectName__/__ProjectName__.csproj')) "$initializer partially renamed the project after the $collision preflight failure."
+    Assert-True (Test-Path -LiteralPath (Join-Path $root '.claude/settings.json.template')) "$initializer partially activated settings after the $collision preflight failure."
+}
+
 function Get-WorkflowIdentityEnvironment([string]$root) {
     $python = (Get-Command python -ErrorAction SilentlyContinue) ?? (Get-Command python3 -ErrorAction Stop)
     $script = @'
@@ -529,6 +616,8 @@ try {
     $bashRoot = Join-Path $tempRoot 'bash'
     Copy-Template $pwshRoot
     Copy-Template $bashRoot
+    Add-LocalData $pwshRoot
+    Add-LocalData $bashRoot
 
     Test-ScriptSyntax $pwshRoot
     Test-PowerShellGitFallbacks
@@ -546,6 +635,8 @@ try {
     $null = Invoke-BashInitializer $bashRoot $projectName $author $authorEmail $githubOwner $description $year
 
     Assert-TreesEqual $pwshRoot $bashRoot
+    Assert-LocalDataPreserved $pwshRoot $projectName
+    Assert-LocalDataPreserved $bashRoot $projectName
     Assert-GeneratedValues $pwshRoot $projectName $author $authorEmail $githubOwner $description $year
     Test-GeneratedSyntax $pwshRoot
     Test-WorkflowIdentity $pwshRoot $author $authorEmail
@@ -554,13 +645,37 @@ try {
     Test-RejectedInput 'bash' 'newline'
     Test-RejectedInput 'pwsh' 'owner'
     Test-RejectedInput 'bash' 'owner'
+    Test-PreflightCollision 'pwsh' 'rename'
+    Test-PreflightCollision 'bash' 'rename'
+    Test-PreflightCollision 'pwsh' 'settings'
+    Test-PreflightCollision 'bash' 'settings'
 
     if (-not $SkipBuild) {
-        Test-BuildAndTests $pwshRoot $projectName
-        Test-BuildAndTests $bashRoot $projectName
+        $cleanProjectName = 'Acme.CleanInit'
+        $cleanPwshRoot = Join-Path $tempRoot 'clean-pwsh'
+        $cleanBashRoot = Join-Path $tempRoot 'clean-bash'
+        Copy-Template $cleanPwshRoot
+        Copy-Template $cleanBashRoot
+        $null = Invoke-Native 'pwsh' @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $cleanProjectName,
+            '-Author', 'Clean Build Author',
+            '-AuthorEmail', 'clean@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Clean build regression',
+            '-Year', '2042',
+            '-KeepScript'
+        ) $cleanPwshRoot
+        $null = Invoke-BashInitializer $cleanBashRoot $cleanProjectName 'Clean Build Author' 'clean@example.invalid' 'safe-owner' 'Clean build regression' '2042'
+        Assert-TreesEqual $cleanPwshRoot $cleanBashRoot
+        Test-GeneratedSyntax $cleanPwshRoot
+        Test-GeneratedSyntax $cleanBashRoot
+        Test-BuildAndTests $cleanPwshRoot $cleanProjectName
+        Test-BuildAndTests $cleanBashRoot $cleanProjectName
     }
 
-    Write-Host 'PASS: PowerShell and Bash initialization are non-cascading, equivalent, syntax-valid, and injection-safe.' -ForegroundColor Green
+    Write-Host 'PASS: PowerShell and Bash initialization are scoped, collision-safe, non-cascading, equivalent, syntax-valid, and injection-safe.' -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

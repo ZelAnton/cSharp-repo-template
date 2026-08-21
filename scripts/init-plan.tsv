@@ -1,0 +1,35 @@
+# kind<TAB>source<TAB>destination; {ProjectName} is expanded only in destinations.
+content	.github/CODEOWNERS
+content	.github/PULL_REQUEST_TEMPLATE.md
+content	.github/workflows/codeql.yml
+content	.github/workflows/release.yml
+content	AGENTS.md
+content	CHANGELOG.md
+content	CLAUDE.md
+content	CONTRIBUTING.md
+content	Directory.Build.props
+content	LICENSE
+content	README.md
+content	SECURITY.md
+content	__ProjectName__.slnx
+content	docs/linux-testing.md
+content	scripts/test-linux.ps1
+content	scripts/tests/release-state.tests.ps1
+content	scripts/tests/test-linux.tests.ps1
+content	src/__ProjectName__/Greeter.cs
+content	src/__ProjectName__/__ProjectName__.csproj
+content	tests/__ProjectName__.Tests/GreeterTests.cs
+content	tests/__ProjectName__.Tests/__ProjectName__.Tests.csproj
+directory	src/__ProjectName__	src/{ProjectName}
+directory	tests/__ProjectName__.Tests	tests/{ProjectName}.Tests
+move	__ProjectName__.sln.DotSettings	{ProjectName}.sln.DotSettings
+move	__ProjectName__.slnx	{ProjectName}.slnx
+move	src/__ProjectName__/Greeter.cs	src/{ProjectName}/Greeter.cs
+move	src/__ProjectName__/__ProjectName__.csproj	src/{ProjectName}/{ProjectName}.csproj
+move	tests/__ProjectName__.Tests/GreeterTests.cs	tests/{ProjectName}.Tests/GreeterTests.cs
+move	tests/__ProjectName__.Tests/__ProjectName__.Tests.csproj	tests/{ProjectName}.Tests/{ProjectName}.Tests.csproj
+activate	.claude/settings.json.template	.claude/settings.json
+remove	TEMPLATE.md
+remove	docs/AGENT-INIT-GUIDE.md
+remove	scripts/tests/init-substitution.tests.ps1
+remove	scripts/init-plan.tsv

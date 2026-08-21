@@ -4,11 +4,13 @@
     Initializes this template into a concrete C# project.
 
 .DESCRIPTION
-    Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
-    __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder names, then
-    removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md,
-    scripts/tests/init-substitution.tests.ps1, and, unless -KeepScript, both
-    initializers — this script and init.sh).
+    Replaces placeholder tokens only in the template-owned files listed by
+    scripts/init-plan.tsv, moves the listed project files to their generated
+    paths, and removes the listed template-only files. Unless -KeepScript is
+    supplied, it also removes both initializers — this script and init.sh.
+
+    The complete plan is validated before the first write. An existing target
+    path causes initialization to stop without changing the repository.
 
     Run it once, right after creating a repository from the template:
 
@@ -161,86 +163,195 @@ function Replace-Tokens([string]$text, [Collections.IDictionary]$map) {
     )
 }
 
-# Binary files carry no tokens; reading/rewriting them as text would corrupt them.
-# The template ships none, but a downstream user may add e.g. a strong-name key or
-# a NuGet package icon before running init, so skip them by extension.
-$binaryExtensions = @('.snk', '.pfx', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.zip')
+$planPath = Join-Path $PSScriptRoot 'init-plan.tsv'
+if (-not (Test-Path -LiteralPath $planPath -PathType Leaf)) {
+    throw "Initialization plan is missing: scripts/init-plan.tsv. No files were changed."
+}
 
-$excludedDirs = @('.git', '.jj', 'bin', 'obj')
-
-function Test-Excluded([string]$fullPath) {
-    $rel = $fullPath.Substring($repoRoot.Length).TrimStart('\', '/')
-    foreach ($seg in ($rel -split '[\\/]')) {
-        if ($excludedDirs -contains $seg) { return $true }
+function Resolve-PlanPath([string]$pathTemplate) {
+    $relative = $pathTemplate.Replace('{ProjectName}', $ProjectName)
+    if (
+        -not $relative -or
+        [IO.Path]::IsPathRooted($relative) -or
+        $relative.Contains('\') -or
+        @($relative.Split('/') | Where-Object { -not $_ -or $_ -eq '.' -or $_ -eq '..' }).Count -gt 0
+    ) {
+        throw "Unsafe path '$pathTemplate' in scripts/init-plan.tsv. No files were changed."
     }
-    return $false
+
+    $fullPath = [IO.Path]::GetFullPath((Join-Path $repoRoot $relative))
+    $rootPrefix = $repoRoot.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if (-not $fullPath.StartsWith($rootPrefix, $comparison)) {
+        throw "Path '$pathTemplate' escapes the repository in scripts/init-plan.tsv. No files were changed."
+    }
+
+    return [pscustomobject]@{
+        Relative = $relative
+        FullPath = $fullPath
+    }
+}
+
+function Test-SamePlanPath([string]$left, [string]$right) {
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    return [string]::Equals($left, $right, $comparison)
+}
+
+$plan = @()
+$lineNumber = 0
+foreach ($line in [IO.File]::ReadAllLines($planPath)) {
+    $lineNumber++
+    if (-not $line -or $line.StartsWith('#')) {
+        continue
+    }
+
+    $fields = $line.Split("`t")
+    $expectedFields = if ($fields[0] -in @('content', 'remove')) { 2 } else { 3 }
+    if ($fields.Count -ne $expectedFields -or $fields[0] -notin @('content', 'directory', 'move', 'activate', 'remove')) {
+        throw "Invalid entry at scripts/init-plan.tsv:$lineNumber. No files were changed."
+    }
+
+    $source = Resolve-PlanPath $fields[1]
+    $destination = if ($expectedFields -eq 3) { Resolve-PlanPath $fields[2] } else { $null }
+    $plan += [pscustomobject]@{
+        Kind = $fields[0]
+        Source = $source
+        Destination = $destination
+    }
+}
+
+if (-not $plan) {
+    throw "Initialization plan is empty: scripts/init-plan.tsv. No files were changed."
+}
+
+# Build the complete mutation set and every replacement in memory before the
+# first write. Paths not listed in the plan are never inspected or modified.
+$contentWrites = @()
+$plannedDestinations = @{}
+foreach ($operation in $plan) {
+    $sourceExists = Test-Path -LiteralPath $operation.Source.FullPath
+    switch ($operation.Kind) {
+        'content' {
+            if (-not $sourceExists) {
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf)) {
+                throw "Template content path is not a file: $($operation.Source.Relative). No files were changed."
+            }
+
+            $text = [IO.File]::ReadAllText($operation.Source.FullPath)
+            $extension = [IO.Path]::GetExtension($operation.Source.FullPath)
+            $map = if ($xmlFileExtensions -contains $extension) { $xmlReplacements } else { $replacements }
+            $newText = Replace-Tokens $text $map
+            if ($newText -cne $text) {
+                $contentWrites += [pscustomobject]@{
+                    Path = $operation.Source
+                    Content = $newText
+                }
+            }
+        }
+        'directory' {
+            if (-not $sourceExists) {
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Container)) {
+                throw "Template directory path is not a directory: $($operation.Source.Relative). No files were changed."
+            }
+            if (Test-SamePlanPath $operation.Source.FullPath $operation.Destination.FullPath) {
+                continue
+            }
+            if (Test-Path -LiteralPath $operation.Destination.FullPath) {
+                throw "Initialization target collision: $($operation.Destination.Relative) already exists. No files were changed."
+            }
+            if ($plannedDestinations.ContainsKey($operation.Destination.FullPath)) {
+                throw "Duplicate initialization target: $($operation.Destination.Relative). No files were changed."
+            }
+            $plannedDestinations[$operation.Destination.FullPath] = $operation.Source.Relative
+        }
+        { $_ -in @('move', 'activate') } {
+            if (-not $sourceExists) {
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf)) {
+                throw "Template move source is not a file: $($operation.Source.Relative). No files were changed."
+            }
+            if (Test-SamePlanPath $operation.Source.FullPath $operation.Destination.FullPath) {
+                continue
+            }
+            if (Test-Path -LiteralPath $operation.Destination.FullPath) {
+                throw "Initialization target collision: $($operation.Destination.Relative) already exists. No files were changed."
+            }
+            if ($plannedDestinations.ContainsKey($operation.Destination.FullPath)) {
+                throw "Duplicate initialization target: $($operation.Destination.Relative). No files were changed."
+            }
+
+            $destinationParent = Split-Path -Parent $operation.Destination.FullPath
+            if ((Test-Path -LiteralPath $destinationParent) -and -not (Test-Path -LiteralPath $destinationParent -PathType Container)) {
+                throw "Initialization target parent is not a directory: $($operation.Destination.Relative). No files were changed."
+            }
+            $plannedDestinations[$operation.Destination.FullPath] = $operation.Source.Relative
+        }
+        'remove' {
+            if ($sourceExists -and -not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf)) {
+                throw "Template-only removal path is not a file: $($operation.Source.Relative). No files were changed."
+            }
+        }
+    }
 }
 
 Write-Host "==> Initializing template as '$ProjectName'" -ForegroundColor Cyan
+Write-Host "    Preflight validated $($plan.Count) template-owned operation(s)." -ForegroundColor DarkGray
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry
-#    the placeholder search-keys as literals, so substituting them would corrupt
-#    the sibling script (which -KeepScript leaves on disk).
-$siblingShPath = Join-Path $PSScriptRoot 'init.sh'
-$files = Get-ChildItem -Path $repoRoot -File -Recurse | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingShPath
+$utf8NoBom = [Text.UTF8Encoding]::new($false)
+foreach ($write in $contentWrites) {
+    [IO.File]::WriteAllText($write.Path.FullPath, $write.Content, $utf8NoBom)
 }
-$contentChanged = 0
-foreach ($file in $files) {
-    if ($binaryExtensions -contains $file.Extension) { continue }
-    $text = [System.IO.File]::ReadAllText($file.FullName)
-    $map = if ($xmlFileExtensions -contains $file.Extension) { $xmlReplacements } else { $replacements }
-    $new = Replace-Tokens $text $map
-    if ($new -ne $text) {
-        [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
-        $contentChanged++
-    }
-}
-Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor DarkGray
+Write-Host "    Updated contents in $($contentWrites.Count) file(s)." -ForegroundColor DarkGray
 
-# 2) Rename files and folders whose name contains the project-name token.
-#    Deepest paths first so child renames don't invalidate parent paths.
-$named = Get-ChildItem -Path $repoRoot -Recurse | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.Name -like '*__ProjectName__*'
-} | Sort-Object { $_.FullName.Length } -Descending
-foreach ($item in $named) {
-    $newName = $item.Name.Replace('__ProjectName__', $ProjectName)
-    Rename-Item -LiteralPath $item.FullName -NewName $newName
-    Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
-}
-
-# 3) Activate the Claude Code shared settings. Shipped inert as a .template file
-#    so the template repository itself does not auto-grant any permissions.
-$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
-if (Test-Path $claudeTemplate) {
-    Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $repoRoot '.claude/settings.json') -Force
-    Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
-}
-
-# 4) Remove template-only files — documentation that only applies while this is a
-#    template, not after it has been stamped into a concrete project.
-$templateOnly = @(
-    (Join-Path $repoRoot 'TEMPLATE.md'),
-    (Join-Path $repoRoot 'docs/AGENT-INIT-GUIDE.md'),
-    (Join-Path $repoRoot 'scripts/tests/init-substitution.tests.ps1')
-)
-foreach ($path in $templateOnly) {
-    if (Test-Path -LiteralPath $path) {
-        Remove-Item -LiteralPath $path -Force
-        Write-Host "    Removed $($path.Substring($repoRoot.Length).TrimStart('\','/'))" -ForegroundColor DarkGray
+# Destination directories are created empty; only listed files move into them.
+# Unknown files inside token-named source directories stay at their original paths.
+foreach ($operation in $plan | Where-Object Kind -eq 'directory') {
+    if (
+        (Test-Path -LiteralPath $operation.Source.FullPath -PathType Container) -and
+        -not (Test-SamePlanPath $operation.Source.FullPath $operation.Destination.FullPath)
+    ) {
+        [IO.Directory]::CreateDirectory($operation.Destination.FullPath) | Out-Null
     }
 }
 
-# Drop docs/ if it's now empty (it usually isn't — linux-testing.md also lives here).
-$docsDir = Join-Path $repoRoot 'docs'
-if ((Test-Path -LiteralPath $docsDir) -and -not (Get-ChildItem -LiteralPath $docsDir -Force)) {
-    Remove-Item -LiteralPath $docsDir -Force
-    Write-Host "    Removed docs" -ForegroundColor DarkGray
+foreach ($operation in $plan | Where-Object Kind -in @('move', 'activate')) {
+    if (
+        (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf) -and
+        -not (Test-SamePlanPath $operation.Source.FullPath $operation.Destination.FullPath)
+    ) {
+        Move-Item -LiteralPath $operation.Source.FullPath -Destination $operation.Destination.FullPath
+        Write-Host "    Moved $($operation.Source.Relative) -> $($operation.Destination.Relative)" -ForegroundColor DarkGray
+    }
 }
-$scriptTestsDir = Join-Path $repoRoot 'scripts/tests'
-if ((Test-Path -LiteralPath $scriptTestsDir) -and -not (Get-ChildItem -LiteralPath $scriptTestsDir -Force)) {
-    Remove-Item -LiteralPath $scriptTestsDir -Force
-    Write-Host "    Removed scripts/tests" -ForegroundColor DarkGray
+
+foreach ($operation in $plan | Where-Object Kind -eq 'remove') {
+    if (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf) {
+        Remove-Item -LiteralPath $operation.Source.FullPath -Force
+        Write-Host "    Removed $($operation.Source.Relative)" -ForegroundColor DarkGray
+    }
+}
+
+$directoryOperations = @($plan | Where-Object Kind -eq 'directory')
+[array]::Reverse($directoryOperations)
+foreach ($operation in $directoryOperations) {
+    if (
+        (Test-Path -LiteralPath $operation.Source.FullPath -PathType Container) -and
+        -not (Get-ChildItem -LiteralPath $operation.Source.FullPath -Force)
+    ) {
+        Remove-Item -LiteralPath $operation.Source.FullPath -Force
+    }
+}
+
+foreach ($relativeDirectory in @('docs', 'scripts/tests')) {
+    $directory = Join-Path $repoRoot $relativeDirectory
+    if ((Test-Path -LiteralPath $directory -PathType Container) -and -not (Get-ChildItem -LiteralPath $directory -Force)) {
+        Remove-Item -LiteralPath $directory -Force
+    }
 }
 
 Write-Host ""

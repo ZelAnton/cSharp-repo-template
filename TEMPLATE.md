@@ -47,20 +47,29 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    `your-org`, a TODO description, the current year). If Git is unavailable or
    either configured identity value is empty, the PowerShell initializer uses
    `Your Name` and `you@example.com` instead. The script:
-   - validates all metadata before writing: author, author email, and description
+   - validates all metadata and the complete `scripts/init-plan.tsv` mutation
+     plan before writing: author, author email, and description
      must be single-line; GitHub owner must be 1-39 letters, digits, or hyphens,
      with no leading or trailing hyphen;
+   - substitutes only the template-owned text files listed as `content` entries
+     in that plan; it never recursively scans the repository, so unknown files,
+     binary data, `.work`, caches, and unknown files inside the original
+     token-named source directories remain byte-for-byte at their original paths;
+   - stops before the first mutation if any planned destination already exists,
+     including a generated solution/project path or `.claude/settings.json`;
    - replaces all placeholder tokens in one pass, so placeholder-like text inside
      a supplied value stays literal and does not trigger another replacement;
    - preserves quotes, backslashes, and shell/Python metacharacters as data,
      XML-escapes values written into XML project files, and safely serializes the
      release-commit identity before the workflow passes it to Bash;
-   - renames the token-named files and folders (`src/__ProjectName__`,
-     `tests/__ProjectName__.Tests`, the `.csproj`/`.slnx`/`.sln.DotSettings`);
+   - moves only the listed solution, Rider settings, sample source/test, and two
+     project files into `src/<project>` / `tests/<project>.Tests`; it removes an
+     original token-named directory only when no local content remains there;
    - activates `.claude/settings.json` from its shipped `.template` form
      (sane shared permissions for `dotnet` commands);
-   - deletes this `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, and the template-only
-     `scripts/tests/init-substitution.tests.ps1`; unless `-KeepScript` /
+   - deletes this `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, the template-only
+     `scripts/tests/init-substitution.tests.ps1`, and the consumed init plan;
+     unless `-KeepScript` /
      `--keep-script` is set, it also removes **both** initializers — itself and its
      sibling — so a generated repo ships neither `init.ps1` nor `init.sh`.
 4. Verify:

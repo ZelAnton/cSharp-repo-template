@@ -3,11 +3,11 @@
 # Initializes this template into a concrete C# project (POSIX counterpart of
 # init.ps1 — use whichever matches your shell; both do the same thing).
 #
-# Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
-# __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder
-# names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md, scripts/tests/init-substitution.tests.ps1) and —
-# unless --keep-script — both initializers (init.sh and init.ps1).
+# Replaces placeholder tokens only in the template-owned files listed by
+# scripts/init-plan.tsv, moves the listed project files to their generated paths,
+# and removes the listed template-only files. Unless --keep-script is supplied,
+# it also removes both initializers (init.sh and init.ps1). The complete plan is
+# validated before the first write; an existing target leaves the tree unchanged.
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name Acme.Widgets \
@@ -140,72 +140,159 @@ replace_tokens() {
   printf '%s%s' "$output" "$rest"
 }
 
-echo "==> Initializing template as '$project_name'"
+plan_path="$script_dir/init-plan.tsv"
+[ -f "$plan_path" ] || die "initialization plan is missing: scripts/init-plan.tsv. No files were changed."
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry
-#    the literal token strings as search keys, so substituting inside them would
-#    corrupt the sibling script. Excluded dirs (.git/.jj/bin/obj) are pruned.
-changed=0
-while IFS= read -r -d '' file; do
-  case "$file" in
-    "$self"|"$sibling_ps1") continue ;;
+resolve_plan_path() {
+  local path_template="$1"
+  local relative="${path_template//\{ProjectName\}/$project_name}"
+  case "$relative" in
+    ""|/*|*\\*|.|..|./*|../*|*/./*|*/../*|*/.|*/..|*//*)
+      die "unsafe path '$path_template' in scripts/init-plan.tsv. No files were changed." ;;
   esac
-  # Skip binary files: they carry no tokens, and reading them through a shell
-  # command substitution strips NUL bytes, which would corrupt the file on rewrite.
-  # The template ships none, but a downstream user may add e.g. a strong-name key
-  # or a NuGet package icon before running init.
-  case "$file" in
-    *.snk|*.pfx|*.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip) continue ;;
-  esac
-  case "$file" in
-    *.csproj|*.props|*.targets|*.slnx|*.config)
-      mode=xml ;;
+  printf '%s' "$relative"
+}
+
+path_exists() { [ -e "$1" ] || [ -L "$1" ]; }
+
+declare -a plan_kinds=()
+declare -a plan_sources=()
+declare -a plan_destinations=()
+line_number=0
+while IFS=$'\t' read -r kind source destination extra || [ -n "${kind:-}${source:-}${destination:-}${extra:-}" ]; do
+  line_number=$((line_number + 1))
+  kind="${kind%$'\r'}"
+  source="${source%$'\r'}"
+  destination="${destination%$'\r'}"
+  extra="${extra%$'\r'}"
+  case "$kind" in
+    ""|\#*) continue ;;
+    content|remove)
+      [ -n "$source" ] && [ -z "$destination" ] && [ -z "$extra" ] ||
+        die "invalid entry at scripts/init-plan.tsv:$line_number. No files were changed." ;;
+    directory|move|activate)
+      [ -n "$source" ] && [ -n "$destination" ] && [ -z "$extra" ] ||
+        die "invalid entry at scripts/init-plan.tsv:$line_number. No files were changed." ;;
     *)
-      mode=raw ;;
+      die "invalid entry at scripts/init-plan.tsv:$line_number. No files were changed." ;;
   esac
-  # Preserve trailing newlines: append a sentinel before capture, strip it after.
-  content="$(cat "$file"; printf x)"; content="${content%x}"
-  orig="$content"
-  content="$(replace_tokens "$content" "$mode"; printf x)"; content="${content%x}"
-  if [ "$content" != "$orig" ]; then
-    printf '%s' "$content" > "$file"
-    changed=$((changed + 1))
-  fi
-done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name bin -o -name obj \) -prune -o -type f -print0)
-echo "    Updated contents in $changed file(s)."
 
-# 2) Rename files and folders whose name contains the project-name token. -depth
-#    processes children before parents so a renamed dir doesn't invalidate paths
-#    (deepest paths first, mirroring init.ps1's length-descending sort).
-while IFS= read -r -d '' item; do
-  case "$item" in
-    */.git/*|*/.jj/*|*/bin/*|*/obj/*) continue ;;
+  plan_kinds[${#plan_kinds[@]}]="$kind"
+  plan_sources[${#plan_sources[@]}]="$(resolve_plan_path "$source")"
+  if [ -n "$destination" ]; then
+    plan_destinations[${#plan_destinations[@]}]="$(resolve_plan_path "$destination")"
+  else
+    plan_destinations[${#plan_destinations[@]}]=""
+  fi
+done < "$plan_path"
+
+[ "${#plan_kinds[@]}" -gt 0 ] || die "initialization plan is empty: scripts/init-plan.tsv. No files were changed."
+
+declare -a planned_targets=()
+declare -a content_paths=()
+declare -a content_values=()
+declare -a directory_sources=()
+declare -a directory_targets=()
+declare -a move_sources=()
+declare -a move_targets=()
+declare -a remove_paths=()
+
+register_target() {
+  local target="$1"
+  local existing
+  for existing in "${planned_targets[@]-}"; do
+    [ "$existing" != "$target" ] || die "duplicate initialization target: ${target#"$repo_root/"}. No files were changed."
+  done
+  planned_targets[${#planned_targets[@]}]="$target"
+}
+
+# Build the complete mutation set and every replacement in memory before the
+# first write. Paths not listed in the plan are never inspected or modified.
+for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
+  kind="${plan_kinds[$i]}"
+  source_relative="${plan_sources[$i]}"
+  destination_relative="${plan_destinations[$i]}"
+  source="$repo_root/$source_relative"
+  destination=""
+  if [ -n "$destination_relative" ]; then
+    destination="$repo_root/$destination_relative"
+  fi
+
+  case "$kind" in
+    content)
+      path_exists "$source" || continue
+      [ -f "$source" ] || die "template content path is not a file: $source_relative. No files were changed."
+      case "$source" in
+        *.csproj|*.props|*.targets|*.slnx|*.config) mode=xml ;;
+        *) mode=raw ;;
+      esac
+      content="$(cat "$source"; printf x)"; content="${content%x}"
+      transformed="$(replace_tokens "$content" "$mode"; printf x)"; transformed="${transformed%x}"
+      if [ "$transformed" != "$content" ]; then
+        content_paths[${#content_paths[@]}]="$source"
+        content_values[${#content_values[@]}]="$transformed"
+      fi
+      ;;
+    directory)
+      path_exists "$source" || continue
+      [ -d "$source" ] || die "template directory path is not a directory: $source_relative. No files were changed."
+      [ "$source" != "$destination" ] || continue
+      ! path_exists "$destination" || die "initialization target collision: $destination_relative already exists. No files were changed."
+      register_target "$destination"
+      directory_sources[${#directory_sources[@]}]="$source"
+      directory_targets[${#directory_targets[@]}]="$destination"
+      ;;
+    move|activate)
+      path_exists "$source" || continue
+      { [ -f "$source" ] || [ -L "$source" ]; } || die "template move source is not a file: $source_relative. No files were changed."
+      [ "$source" != "$destination" ] || continue
+      ! path_exists "$destination" || die "initialization target collision: $destination_relative already exists. No files were changed."
+      parent="$(dirname "$destination")"
+      if path_exists "$parent" && [ ! -d "$parent" ]; then
+        die "initialization target parent is not a directory: $destination_relative. No files were changed."
+      fi
+      register_target "$destination"
+      move_sources[${#move_sources[@]}]="$source"
+      move_targets[${#move_targets[@]}]="$destination"
+      ;;
+    remove)
+      if path_exists "$source" && { [ ! -f "$source" ] && [ ! -L "$source" ]; }; then
+        die "template-only removal path is not a file: $source_relative. No files were changed."
+      fi
+      remove_paths[${#remove_paths[@]}]="$source"
+      ;;
   esac
-  dir="$(dirname "$item")"
-  base="$(basename "$item")"
-  newbase="${base//__ProjectName__/$project_name}"
-  if [ "$newbase" != "$base" ]; then
-    mv "$item" "$dir/$newbase"
-    echo "    Renamed $base -> $newbase"
+done
+
+echo "==> Initializing template as '$project_name'"
+echo "    Preflight validated ${#plan_kinds[@]} template-owned operation(s)."
+
+for ((i = 0; i < ${#content_paths[@]}; i++)); do
+  printf '%s' "${content_values[$i]}" > "${content_paths[$i]}"
+done
+echo "    Updated contents in ${#content_paths[@]} file(s)."
+
+# Destination directories are created empty; only listed files move into them.
+# Unknown files inside token-named source directories stay at their original paths.
+for ((i = 0; i < ${#directory_sources[@]}; i++)); do
+  mkdir -- "${directory_targets[$i]}"
+done
+for ((i = 0; i < ${#move_sources[@]}; i++)); do
+  mv -- "${move_sources[$i]}" "${move_targets[$i]}"
+  echo "    Moved ${move_sources[$i]#"$repo_root/"} -> ${move_targets[$i]#"$repo_root/"}"
+done
+for path in "${remove_paths[@]}"; do
+  if [ -f "$path" ] || [ -L "$path" ]; then
+    rm -f -- "$path"
+    echo "    Removed ${path#"$repo_root/"}"
   fi
-done < <(find "$repo_root" -depth -name '*__ProjectName__*' -print0)
+done
 
-# 3) Activate the Claude Code shared settings. Shipped inert as a .template file
-#    so the template repository itself does not auto-grant any permissions.
-if [ -f "$repo_root/.claude/settings.json.template" ]; then
-  mv -f "$repo_root/.claude/settings.json.template" "$repo_root/.claude/settings.json"
-  echo "    Activated .claude/settings.json"
-fi
-
-# 4) Remove template-only files — documentation that only applies while this is a
-#    template, not after it has been stamped into a concrete project.
-rm -f \
-  "$repo_root/TEMPLATE.md" \
-  "$repo_root/docs/AGENT-INIT-GUIDE.md" \
-  "$repo_root/scripts/tests/init-substitution.tests.ps1"
-# Drop docs/ if it's now empty (it usually isn't — linux-testing.md also lives here).
-rmdir "$repo_root/docs" 2>/dev/null || true
-rmdir "$repo_root/scripts/tests" 2>/dev/null || true
+for ((i = ${#directory_sources[@]} - 1; i >= 0; i--)); do
+  rmdir -- "${directory_sources[$i]}" 2>/dev/null || true
+done
+rmdir -- "$repo_root/docs" 2>/dev/null || true
+rmdir -- "$repo_root/scripts/tests" 2>/dev/null || true
 
 echo ""
 echo "Done. Next steps:"
