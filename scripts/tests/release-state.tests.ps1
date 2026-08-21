@@ -14,6 +14,14 @@ $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "release-state-tests-$([Guid]::
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $python = (Get-Command python3 -CommandType Application -ErrorAction SilentlyContinue) ?? `
     (Get-Command python -CommandType Application -ErrorAction Stop)
+$bashPath = if ([OperatingSystem]::IsWindows()) {
+    $git = Get-Command git -CommandType Application -ErrorAction Stop
+    $gitBashPath = [IO.Path]::GetFullPath((Join-Path (Split-Path $git.Source -Parent) '../bin/bash.exe'))
+    (Get-Item -LiteralPath $gitBashPath -ErrorAction Stop).FullName
+}
+else {
+    (Get-Command bash -CommandType Application -ErrorAction Stop).Source
+}
 
 function Assert-Equal([object]$expected, [object]$actual, [string]$message) {
     if ($actual -cne $expected) {
@@ -79,6 +87,64 @@ function Get-WorkflowStepBlock([string]$workflow, [string]$stepName) {
     $match = [regex]::Match($workflow, $pattern)
     Assert-True $match.Success "Could not extract the '$stepName' step from release.yml."
     return $match.Groups['block'].Value
+}
+
+function Get-WorkflowRunScript([string]$workflow, [string]$stepName) {
+    $block = Get-WorkflowStepBlock $workflow $stepName
+    $match = [regex]::Match($block, "(?ms)^        run: \|\r?\n(?<code>.*)$")
+    Assert-True $match.Success "Could not extract the '$stepName' run script from release.yml."
+    return [regex]::Replace($match.Groups['code'].Value, '(?m)^          ', '')
+}
+
+function Invoke-BashBlock(
+    [string]$workingDirectory,
+    [string]$scriptName,
+    [string]$script,
+    [hashtable]$environment,
+    [switch]$ExpectFailure
+) {
+    $scriptPath = Join-Path $workingDirectory $scriptName
+    [IO.File]::WriteAllText($scriptPath, "$script`n", $utf8NoBom)
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $bashPath
+    $startInfo.WorkingDirectory = $workingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    [void]$startInfo.ArgumentList.Add($scriptName)
+    foreach ($entry in $environment.GetEnumerator()) {
+        $startInfo.Environment[$entry.Key] = $entry.Value
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    $output = "$stdout$stderr"
+
+    if ($ExpectFailure) {
+        Assert-True ($process.ExitCode -ne 0) "$scriptName should fail closed. Output: $output"
+        return $output
+    }
+
+    Assert-Equal 0 $process.ExitCode "$scriptName failed. Output: $output"
+    return $output
+}
+
+function Get-Sha256Hex([string]$path) {
+    return [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($path))).ToLowerInvariant()
+}
+
+function Read-KeyValueFile([string]$path) {
+    $values = @{}
+    foreach ($line in [IO.File]::ReadAllLines($path)) {
+        $parts = $line.Split('=', 2)
+        $values[$parts[0]] = $parts[1]
+    }
+    return $values
 }
 
 function Invoke-PythonBlock(
@@ -417,12 +483,17 @@ try {
     $promoteScript = Get-WorkflowPython $workflow 'Promote Unreleased section in CHANGELOG.md'
     $extractScript = Get-WorkflowPython $workflow 'Extract release notes from release section'
     $publishScript = Get-WorkflowPython $workflow 'Push to NuGet.org (irreversible pivot)'
+    $bundleScript = Get-WorkflowRunScript $workflow 'Create local release recovery bundle'
+    $sourceGuardScript = Get-WorkflowRunScript $workflow 'Guard — remote main unchanged before NuGet pivot'
     $publishStep = Get-WorkflowStepBlock $workflow 'Push to NuGet.org (irreversible pivot)'
     $pushStep = Get-WorkflowStepBlock $workflow 'Push the release commit + tag (atomic)'
     $releaseStep = Get-WorkflowStepBlock $workflow 'Create or update the GitHub Release (idempotent)'
     $recoveryStep = Get-WorkflowStepBlock $workflow 'Preserve exact post-pivot recovery state'
 
     $steps = [ordered]@{
+        capture = '      - name: Capture immutable release source'
+        checkout = '      - uses: actions/checkout@'
+        checkout_guard = '      - name: Verify immutable release source checkout'
         bump = '      - name: Bump version in csproj'
         promote = '      - name: Promote Unreleased section in CHANGELOG.md'
         extract = '      - name: Extract release notes from release section'
@@ -433,6 +504,7 @@ try {
         checksums = '      - name: Generate SHA256SUMS'
         commit = '      - name: Commit and tag the release (local only)'
         bundle = '      - name: Create local release recovery bundle'
+        source_guard = '      - name: Guard — remote main unchanged before NuGet pivot'
         publish = '      - name: Push to NuGet.org (irreversible pivot)'
         push = '      - name: Push the release commit + tag (atomic)'
         release = '      - name: Create or update the GitHub Release (idempotent)'
@@ -447,11 +519,16 @@ try {
     }
 
     Assert-Equal 1 ([regex]::Matches($workflow, '(?m)^      - name: Promote Unreleased section in CHANGELOG\.md$').Count) 'The workflow must promote the changelog exactly once.'
+    Assert-True $workflow.Contains('ref: ${{ steps.release_source.outputs.sha }}') 'Checkout no longer uses the immutable dispatch source SHA.'
+    Assert-True $workflow.Contains('SOURCE_SHA: ${{ steps.release_source.outputs.sha }}') 'Release steps no longer consume the captured source SHA.'
     Assert-True $workflow.Contains('dotnet pack src/__ProjectName__/__ProjectName__.csproj --no-build --configuration Release --output ./artifacts /p:Version=${{ steps.version.outputs.version }}') 'Pack no longer uses the computed release version.'
     Assert-True $project.Contains('<None Include="$(RepoRoot)CHANGELOG.md" Pack="true" PackagePath="\" />') 'The package no longer includes the root release-state CHANGELOG.md.'
     Assert-True $project.Contains('<PackageReleaseNotes Condition="Exists(''$(RepoRoot)release-notes.md'')">$([System.IO.File]::ReadAllText(''$(RepoRoot)release-notes.md''))</PackageReleaseNotes>') 'The package no longer consumes the extracted release notes.'
     Assert-True $workflow.Contains('git add src/__ProjectName__/__ProjectName__.csproj CHANGELOG.md') 'The local release commit no longer records both release-state inputs.'
-    Assert-True $workflow.Contains('git bundle create ./artifacts/release-recovery.bundle HEAD "$TAG"') 'The workflow no longer preserves the exact local release commit and tag for recovery.'
+    Assert-True $workflow.Contains('git bundle create ./artifacts/release-recovery.bundle HEAD "$TAG"') 'The workflow no longer preserves a cloneable exact release commit and tag for recovery.'
+    Assert-True $workflow.Contains('"$(git rev-parse --verify HEAD^)" != "$SOURCE_SHA"') 'The workflow no longer verifies release ancestry against the immutable source.'
+    Assert-True $workflow.Contains('--force-with-lease="refs/heads/main:$SOURCE_SHA"') 'The remote main update is no longer bound to the exact captured source SHA.'
+    Assert-True $workflow.Contains('artifacts/release-recovery-manifest.txt') 'The exact recovery artifact no longer includes source, release, tag, and integrity metadata.'
     Assert-True $workflow.Contains('id: nuget_publish') 'The NuGet pivot no longer exposes its outcome to the recovery guard.'
     Assert-False $publishStep.Contains('continue-on-error: true') 'An ambiguous NuGet outcome must stop VCS and GitHub Release publication.'
     Assert-True $publishScript.Contains('write_output("acceptance", "not-attempted")') 'The NuGet pivot no longer distinguishes a skipped attempt from an ambiguous response.'
@@ -479,6 +556,7 @@ try {
     Assert-False ([regex]::IsMatch($pushStep, '(?m)^        if:')) 'The VCS push must retain the default success guard after the NuGet pivot.'
     Assert-False ([regex]::IsMatch($releaseStep, '(?m)^        if:')) 'The GitHub Release must retain the default success guard after the NuGet pivot.'
     Assert-True $recoveryStep.Contains('artifacts/release-recovery.bundle') 'The recovery artifact no longer contains the local release commit and tag.'
+    Assert-True $recoveryStep.Contains('artifacts/release-recovery-manifest.txt') 'The recovery artifact no longer contains its immutable source and integrity manifest.'
     Assert-True $recoveryStep.Contains('artifacts/*.nupkg') 'The recovery artifact no longer contains the exact published package.'
     Assert-True $recoveryStep.Contains('artifacts/*.snupkg') 'The recovery artifact no longer contains the exact symbol package.'
     Assert-True $recoveryStep.Contains('artifacts/SHA256SUMS') 'The recovery artifact no longer contains the package checksums.'
@@ -809,23 +887,96 @@ subprocess.run = cancelled_after_attempt
     Assert-True $failure.Contains('Release section [9.9.9] in CHANGELOG.md is missing or empty.') 'Missing versioned release section did not produce the expected fail-closed diagnostic.'
     Write-Host 'PASS missing-release-section'
 
-    $bundleRoot = Join-Path $tempRoot 'recovery-bundle'
+    $bundleRoot = Join-Path $tempRoot 'immutable-release-source'
+    $remoteRoot = Join-Path $tempRoot 'immutable-release-source.git'
     [IO.Directory]::CreateDirectory((Join-Path $bundleRoot 'artifacts')) | Out-Null
-    [IO.File]::WriteAllText((Join-Path $bundleRoot 'payload.txt'), "release state`n", $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $bundleRoot 'payload.txt'), "source state`n", $utf8NoBom)
     [void](Invoke-Git $bundleRoot @('init', '--initial-branch=main'))
     [void](Invoke-Git $bundleRoot @('config', 'user.name', 'Release Test'))
     [void](Invoke-Git $bundleRoot @('config', 'user.email', 'release-test@example.invalid'))
     [void](Invoke-Git $bundleRoot @('add', 'payload.txt'))
+    [void](Invoke-Git $bundleRoot @('commit', '-m', 'Source state'))
+    $sourceCommit = @(Invoke-Git $bundleRoot @('rev-parse', 'HEAD'))[-1]
+    [void](Invoke-Git $tempRoot @('init', '--bare', '--initial-branch=main', $remoteRoot))
+    [void](Invoke-Git $bundleRoot @('remote', 'add', 'origin', $remoteRoot))
+    [void](Invoke-Git $bundleRoot @('push', 'origin', 'main:main'))
+
+    [IO.File]::WriteAllText((Join-Path $bundleRoot 'payload.txt'), "release state`n", $utf8NoBom)
+    [void](Invoke-Git $bundleRoot @('add', 'payload.txt'))
     [void](Invoke-Git $bundleRoot @('commit', '-m', 'Release v1.2.4'))
-    [void](Invoke-Git $bundleRoot @('tag', 'v1.2.4'))
-    [void](Invoke-Git $bundleRoot @('bundle', 'create', './artifacts/release-recovery.bundle', 'HEAD', 'v1.2.4'))
-    [void](Invoke-Git $bundleRoot @('bundle', 'verify', './artifacts/release-recovery.bundle'))
+    $releaseCommit = @(Invoke-Git $bundleRoot @('rev-parse', 'HEAD'))[-1]
+    [void](Invoke-Git $bundleRoot @('tag', 'v1.2.4', $releaseCommit))
+    $packagePath = Join-Path $bundleRoot 'artifacts/package.1.2.4.nupkg'
+    $symbolsPath = Join-Path $bundleRoot 'artifacts/package.1.2.4.snupkg'
+    $checksumsPath = Join-Path $bundleRoot 'artifacts/SHA256SUMS'
+    $notesPath = Join-Path $bundleRoot 'release-notes.md'
+    [IO.File]::WriteAllText($packagePath, "package bytes`n", $utf8NoBom)
+    [IO.File]::WriteAllText($symbolsPath, "symbol bytes`n", $utf8NoBom)
+    [IO.File]::WriteAllText($notesPath, "### Fixed`n- Preserve exact release state.`n", $utf8NoBom)
+    [IO.File]::WriteAllText(
+        $checksumsPath,
+        "$(Get-Sha256Hex $packagePath)  $([IO.Path]::GetFileName($packagePath))`n$(Get-Sha256Hex $symbolsPath)  $([IO.Path]::GetFileName($symbolsPath))`n",
+        $utf8NoBom)
+
+    [void](Invoke-BashBlock `
+        -WorkingDirectory $bundleRoot `
+        -ScriptName 'create-recovery.sh' `
+        -Script $bundleScript `
+        -Environment @{
+            GITHUB_REPOSITORY = 'example/release-test'
+            SOURCE_SHA = $sourceCommit
+            RELEASE_SHA = $releaseCommit
+            TAG = 'v1.2.4'
+        })
+    [void](Invoke-BashBlock `
+        -WorkingDirectory $bundleRoot `
+        -ScriptName 'guard-release.sh' `
+        -Script $sourceGuardScript `
+        -Environment @{
+            SOURCE_SHA = $sourceCommit
+            RELEASE_SHA = $releaseCommit
+            TAG = 'v1.2.4'
+        })
+    Write-Host 'PASS immutable-source-normal-release'
+
+    $manifestPath = Join-Path $bundleRoot 'artifacts/release-recovery-manifest.txt'
+    $manifest = Read-KeyValueFile $manifestPath
+    Assert-Equal 'release-recovery-v1' $manifest['schema'] 'The recovery manifest schema changed unexpectedly.'
+    Assert-Equal $sourceCommit $manifest['source_sha'] 'The recovery manifest lost the immutable source SHA.'
+    Assert-Equal $releaseCommit $manifest['release_sha'] 'The recovery manifest lost the exact release commit.'
+    Assert-Equal 'v1.2.4' $manifest['tag'] 'The recovery manifest lost the exact release tag.'
+    Assert-Equal (Get-Sha256Hex $checksumsPath) $manifest['package_checksums_sha256'] 'The recovery manifest does not authenticate the package checksums.'
+    Assert-Equal (Get-Sha256Hex (Join-Path $bundleRoot 'artifacts/release-recovery.bundle')) $manifest['bundle_sha256'] 'The recovery manifest does not authenticate the exact bundle.'
+    Assert-Equal (Get-Sha256Hex $notesPath) $manifest['release_notes_sha256'] 'The recovery manifest does not authenticate the exact release notes.'
+
     [void](Invoke-Git $bundleRoot @('clone', './artifacts/release-recovery.bundle', 'recovered'))
-    $releaseCommit = @(Invoke-Git $bundleRoot @('rev-parse', 'v1.2.4^{}'))[-1]
     $recoveredCommit = @(Invoke-Git (Join-Path $bundleRoot 'recovered') @('rev-parse', 'HEAD'))[-1]
     Assert-Equal $releaseCommit $recoveredCommit 'The recovery bundle clone did not restore the exact release commit.'
+    Assert-Equal $sourceCommit (@(Invoke-Git (Join-Path $bundleRoot 'recovered') @('rev-parse', 'HEAD^'))[-1]) 'The recovery bundle release commit is not based on the immutable source.'
     Assert-Equal 'v1.2.4' (@(Invoke-Git (Join-Path $bundleRoot 'recovered') @('tag', '--points-at', 'HEAD'))[-1]) 'The recovery bundle clone did not restore the release tag.'
-    Write-Host 'PASS recovery-bundle'
+    Write-Host 'PASS exact-post-pivot-recovery-state'
+
+    $moverRoot = Join-Path $tempRoot 'main-mover'
+    [void](Invoke-Git $tempRoot @('clone', $remoteRoot, $moverRoot))
+    [void](Invoke-Git $moverRoot @('config', 'user.name', 'Concurrent Test'))
+    [void](Invoke-Git $moverRoot @('config', 'user.email', 'concurrent-test@example.invalid'))
+    [IO.File]::WriteAllText((Join-Path $moverRoot 'concurrent.txt'), "remote movement`n", $utf8NoBom)
+    [void](Invoke-Git $moverRoot @('add', 'concurrent.txt'))
+    [void](Invoke-Git $moverRoot @('commit', '-m', 'Concurrent main movement'))
+    [void](Invoke-Git $moverRoot @('push', 'origin', 'main:main'))
+    $guardFailure = Invoke-BashBlock `
+        -WorkingDirectory $bundleRoot `
+        -ScriptName 'guard-moved-main.sh' `
+        -Script $sourceGuardScript `
+        -Environment @{
+            SOURCE_SHA = $sourceCommit
+            RELEASE_SHA = $releaseCommit
+            TAG = 'v1.2.4'
+        } `
+        -ExpectFailure
+    Assert-True $guardFailure.Contains('origin/main moved from immutable release source') 'Concurrent main movement did not fail closed before the NuGet pivot.'
+    Assert-True $guardFailure.Contains('No package was published') 'Concurrent main movement omitted the no-publish recovery direction.'
+    Write-Host 'PASS moved-main-blocks-pivot'
 
     Write-Host 'All release-state regression tests passed.'
 }

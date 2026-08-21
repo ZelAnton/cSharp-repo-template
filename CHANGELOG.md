@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Release workflow makes NuGet publication the irreversible pivot: confirmed terminal rejections leave no remote trace, while ambiguous failures, timeouts, and cancellations preserve the exact immutable recovery state.
+- Releases now pin the dispatch source commit, stop before NuGet if `main` moves, and bind post-pivot recovery and trunk advancement to that exact source and release state.
 - All GitHub Actions are pinned to a commit SHA (with a version comment) instead of a moving tag; Dependabot now groups action bumps into a single weekly PR.
 
 ### Fixed

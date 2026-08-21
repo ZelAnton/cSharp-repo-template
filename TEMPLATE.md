@@ -163,18 +163,19 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
   tokens (no stored secret). See the comment above the *Push to NuGet.org* step in
   `.github/workflows/release.yml`.
 - **Release ordering** — the NuGet publish is the single irreversible step, so the
-  workflow makes it the pivot. Before packing, it writes the final project version,
-  promotes the Unreleased changelog entries into that version's section, and derives
-  release notes from that section; the package, local commit, and local tag therefore
-  use one release state. It then publishes the package and only after success pushes
-  the commit+tag to `main`. A structured terminal rejection proves that NuGet did not
+  workflow makes it the pivot. It captures the dispatch commit as a full immutable
+  source SHA, checks out that SHA, and derives the version, package, notes, local
+  release commit, and tag from it. Immediately before publication, `origin/main`
+  must still equal the captured source; otherwise the workflow stops without a
+  NuGet attempt. After acceptance, the atomic push can advance `main` only from that
+  exact expected SHA. A structured terminal rejection proves that NuGet did not
   accept the package and leaves no remote recovery artifact. A timeout, cancellation,
   or unclassified client failure after an attempt is ambiguous, so the workflow
-  preserves the exact packages, notes, checksums, and local release tag as a
-  `release-recovery-vX.Y.Z` artifact; do not re-run until the version is confirmed
-  absent. If NuGet accepted it, use that immutable artifact instead of rebuilding
-  regardless of what the publish client or later steps reported (see
-  `.github/workflows/release.yml`).
+  preserves the exact bundle, packages, checksums, notes, source/release SHAs, and tag
+  as a `release-recovery-vX.Y.Z` artifact; do not re-run until the version is
+  confirmed absent. If NuGet accepted it, verify and use that run's immutable
+  artifact instead of rebuilding, regardless of what the publish client or later
+  steps reported (see `.github/workflows/release.yml`).
 
 ## Recommended add-ons (not enabled by default)
 

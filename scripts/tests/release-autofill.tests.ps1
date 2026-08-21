@@ -165,12 +165,15 @@ try {
     Assert-True ($workflow.Contains('first_release=$FIRST_RELEASE')) 'Determine next version does not expose first-release mode.'
     Assert-True ($workflow.Contains('previous_tag=$PREVIOUS_TAG')) 'Determine next version does not expose the real previous tag.'
 
+    $sourceCaptureIndex = $workflow.IndexOf('      - name: Capture immutable release source')
     $autoFillIndex = $workflow.IndexOf('      - name: Auto-fill [Unreleased] from git log if empty')
     $localCommitIndex = $workflow.IndexOf('      - name: Commit and tag the release (local only)')
+    $remoteGuardIndex = $workflow.IndexOf('      - name: Guard — remote main unchanged before NuGet pivot')
     $publishIndex = $workflow.IndexOf('      - name: Push to NuGet.org (irreversible pivot)')
     $pushIndex = $workflow.IndexOf('      - name: Push the release commit + tag (atomic)')
+    Assert-True ($sourceCaptureIndex -ge 0 -and $sourceCaptureIndex -lt $autoFillIndex) 'The immutable release source is not captured before version/changelog derivation.'
     Assert-True ($autoFillIndex -ge 0 -and $autoFillIndex -lt $localCommitIndex) 'Auto-fill moved after the local release commit.'
-    Assert-True ($localCommitIndex -lt $publishIndex) 'The local release commit moved after the NuGet publish pivot.'
+    Assert-True ($localCommitIndex -lt $remoteGuardIndex -and $remoteGuardIndex -lt $publishIndex) 'The exact remote-main guard must run after the local release commit and immediately before the NuGet pivot.'
     Assert-True ($publishIndex -lt $pushIndex) 'The remote push moved before the NuGet publish pivot.'
 
     $baseArguments = @('git-cliff', '--config', 'cliff.toml', '--strip', 'all')
