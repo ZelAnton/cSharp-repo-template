@@ -167,11 +167,11 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
   promotes the Unreleased changelog entries into that version's section, and derives
   release notes from that section; the package, local commit, and local tag therefore
   use one release state. It then publishes the package and only after success pushes
-  the commit+tag to `main`. A failure before or at the publish leaves nothing on the
-  remote or registry, so it is safe to re-run. If a later push or GitHub Release step
-  fails, the run uploads the exact packages, notes, checksums, and local release tag as
-  a `release-recovery-vX.Y.Z` artifact; use that artifact instead of rebuilding or
-  re-running the workflow (see `.github/workflows/release.yml`).
+  the commit+tag to `main`. Re-run only when NuGet did not accept the package. Once
+  NuGet accepts it, a later push or GitHub Release failure uploads the exact packages,
+  notes, checksums, and local release tag as a `release-recovery-vX.Y.Z` artifact; use
+  that immutable artifact instead of rebuilding or re-running the workflow (see
+  `.github/workflows/release.yml`).
 
 ## Recommended add-ons (not enabled by default)
 

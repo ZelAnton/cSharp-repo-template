@@ -6,6 +6,10 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $workflowPath = Join-Path $repoRoot '.github/workflows/release.yml'
 $projectPath = Join-Path $repoRoot 'src/__ProjectName__/__ProjectName__.csproj'
+$agentsPath = Join-Path $repoRoot 'AGENTS.md'
+$claudePath = Join-Path $repoRoot 'CLAUDE.md'
+$templatePath = Join-Path $repoRoot 'TEMPLATE.md'
+$changelogGuidancePath = Join-Path $repoRoot 'CHANGELOG.md'
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "release-state-tests-$([Guid]::NewGuid().ToString('N'))"
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $python = (Get-Command python3 -CommandType Application -ErrorAction SilentlyContinue) ?? `
@@ -23,12 +27,42 @@ function Assert-True([bool]$condition, [string]$message) {
     }
 }
 
+function Assert-False([bool]$condition, [string]$message) {
+    if ($condition) {
+        throw $message
+    }
+}
+
+function Assert-BytesEqual([byte[]]$expected, [byte[]]$actual, [string]$message) {
+    Assert-Equal $expected.Length $actual.Length "$message Byte lengths differ."
+    for ($index = 0; $index -lt $expected.Length; $index++) {
+        if ($actual[$index] -ne $expected[$index]) {
+            throw "$message First differing byte: $index."
+        }
+    }
+}
+
 function Invoke-Git([string]$workingDirectory, [string[]]$arguments) {
     $output = @(& git -C $workingDirectory @arguments 2>&1)
     if ($LASTEXITCODE -ne 0) {
         throw "git $($arguments -join ' ') failed in $workingDirectory.`n$($output -join "`n")"
     }
     return $output
+}
+
+function Invoke-Dotnet([string]$workingDirectory, [string[]]$arguments) {
+    $previousLocation = Get-Location
+    try {
+        Set-Location -LiteralPath $workingDirectory
+        $output = @(& dotnet @arguments 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            throw "dotnet $($arguments -join ' ') failed in $workingDirectory.`n$($output -join "`n")"
+        }
+        return $output
+    }
+    finally {
+        Set-Location -LiteralPath $previousLocation
+    }
 }
 
 function Get-WorkflowPython([string]$workflow, [string]$stepName) {
@@ -137,12 +171,93 @@ function Invoke-ReleaseStateCase(
     Assert-True $releaseState.Contains("### Added`n- Add one release-state source") "$name Added note is not present in the release-state changelog."
     Assert-True $releaseState.Contains("### Fixed`n- Fix packed changelog drift") "$name Fixed note is not present in the release-state changelog."
     Write-Host "PASS $name"
+
+    return [pscustomobject]@{
+        Root = $caseRoot
+        Changelog = $releaseState
+        Notes = $notes
+        ExpectedNotes = $expectedNotes
+    }
+}
+
+function Test-PackedReleaseState([pscustomobject]$releaseCase, [string]$version, [string]$tag) {
+    $caseRoot = $releaseCase.Root
+    [IO.File]::WriteAllText((Join-Path $caseRoot 'README.md'), "# Package identity test`n", $utf8NoBom)
+    [void](Invoke-Git $caseRoot @('init', '--initial-branch=main'))
+    [void](Invoke-Git $caseRoot @('config', 'user.name', 'Release Test'))
+    [void](Invoke-Git $caseRoot @('config', 'user.email', 'release-test@example.invalid'))
+    [void](Invoke-Git $caseRoot @('add', 'CHANGELOG.md', 'README.md'))
+    [void](Invoke-Git $caseRoot @('commit', '-m', "Release $tag"))
+    [void](Invoke-Git $caseRoot @('tag', $tag))
+
+    $workingChangelogObject = @(Invoke-Git $caseRoot @('hash-object', 'CHANGELOG.md'))[-1]
+    $taggedChangelogObject = @(Invoke-Git $caseRoot @('rev-parse', "${tag}:CHANGELOG.md"))[-1]
+    Assert-Equal $taggedChangelogObject $workingChangelogObject 'The pack input CHANGELOG.md does not match the tagged release state.'
+
+    $artifactRoot = Join-Path $caseRoot 'artifacts'
+    [IO.Directory]::CreateDirectory($artifactRoot) | Out-Null
+    $packRepoRoot = "$caseRoot$([IO.Path]::DirectorySeparatorChar)"
+    [void](Invoke-Dotnet $repoRoot @(
+        'pack',
+        $projectPath,
+        '--configuration', 'Release',
+        '--output', $artifactRoot,
+        "/p:Version=$version",
+        "/p:RepoRoot=$packRepoRoot"
+    ))
+
+    $packages = @(Get-ChildItem -LiteralPath $artifactRoot -Filter '*.nupkg' -File |
+        Where-Object { -not $_.Name.EndsWith('.snupkg', [StringComparison]::OrdinalIgnoreCase) })
+    Assert-Equal 1 $packages.Count 'The pack regression must produce exactly one .nupkg.'
+
+    $archive = [IO.Compression.ZipFile]::OpenRead($packages[0].FullName)
+    try {
+        $changelogEntry = $archive.Entries | Where-Object { $_.FullName -ceq 'CHANGELOG.md' }
+        Assert-True ($null -ne $changelogEntry) 'The packed artifact does not contain root CHANGELOG.md.'
+        $changelogStream = $changelogEntry.Open()
+        try {
+            $memory = [IO.MemoryStream]::new()
+            $changelogStream.CopyTo($memory)
+            $packedChangelog = $memory.ToArray()
+        }
+        finally {
+            $changelogStream.Dispose()
+        }
+        Assert-BytesEqual ([IO.File]::ReadAllBytes((Join-Path $caseRoot 'CHANGELOG.md'))) $packedChangelog 'Packed CHANGELOG.md differs from the tagged release state.'
+
+        $nuspecEntry = $archive.Entries | Where-Object { $_.FullName.EndsWith('.nuspec', [StringComparison]::OrdinalIgnoreCase) }
+        Assert-True ($null -ne $nuspecEntry) 'The packed artifact does not contain a nuspec.'
+        $nuspecStream = $nuspecEntry.Open()
+        try {
+            $nuspec = [xml]::new()
+            $nuspec.Load($nuspecStream)
+        }
+        finally {
+            $nuspecStream.Dispose()
+        }
+        $releaseNotesNode = $nuspec.SelectSingleNode('/*[local-name()="package"]/*[local-name()="metadata"]/*[local-name()="releaseNotes"]')
+        Assert-True ($null -ne $releaseNotesNode) 'The packed nuspec does not contain release notes.'
+        $packedNotes = $releaseNotesNode.InnerText.Replace("`r`n", "`n").TrimEnd("`r", "`n")
+        $expectedNotes = $releaseCase.ExpectedNotes.TrimEnd("`r", "`n")
+        $extractedNotes = $releaseCase.Notes.TrimEnd("`r", "`n")
+        Assert-Equal $expectedNotes $packedNotes 'Packed release notes differ from the versioned changelog section.'
+        Assert-Equal $extractedNotes $packedNotes 'Packed release notes differ from the exact notes derived for this tag.'
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    Write-Host 'PASS packed-release-state'
 }
 
 try {
     [IO.Directory]::CreateDirectory($tempRoot) | Out-Null
     $workflow = [IO.File]::ReadAllText($workflowPath)
     $project = [IO.File]::ReadAllText($projectPath)
+    $agents = [IO.File]::ReadAllText($agentsPath)
+    $claude = [IO.File]::ReadAllText($claudePath)
+    $template = [IO.File]::ReadAllText($templatePath)
+    $changelogGuidance = [IO.File]::ReadAllText($changelogGuidancePath)
     $promoteScript = Get-WorkflowPython $workflow 'Promote Unreleased section in CHANGELOG.md'
     $extractScript = Get-WorkflowPython $workflow 'Extract release notes from release section'
     $recoveryStep = Get-WorkflowStepBlock $workflow 'Preserve exact post-pivot recovery state'
@@ -184,17 +299,27 @@ try {
     Assert-True $recoveryStep.Contains('artifacts/*.snupkg') 'The recovery artifact no longer contains the exact symbol package.'
     Assert-True $recoveryStep.Contains('artifacts/SHA256SUMS') 'The recovery artifact no longer contains the package checksums.'
     Assert-True $recoveryStep.Contains('release-notes.md') 'The recovery artifact no longer contains the exact release notes.'
+    $allGuidance = "$workflow`n$agents`n$claude`n$template`n$changelogGuidance"
+    Assert-False ([regex]::IsMatch($allGuidance, 'A failure after the pivot is recoverable\s+by re-run', [Text.RegularExpressions.RegexOptions]::IgnoreCase)) 'Shipped guidance still permits rebuilding after the publish pivot.'
+    Assert-False ([regex]::IsMatch($allGuidance, 'after the publish but before the tag is pushed is also safe to re-run', [Text.RegularExpressions.RegexOptions]::IgnoreCase)) 'Shipped guidance still permits rebuilding after publish when the tag push failed.'
+    Assert-False ([regex]::IsMatch($allGuidance, 'failure (?:before or at|up to and including) the publish[^\n]*safe to re-run', [Text.RegularExpressions.RegexOptions]::IgnoreCase)) 'Shipped guidance still treats every publish-step failure as safe to rerun without checking acceptance.'
+    Assert-False ([regex]::IsMatch($allGuidance, 'NuGet push failed[^\n]*safe to re-run', [Text.RegularExpressions.RegexOptions]::IgnoreCase)) 'Publish failure guidance must require confirming that NuGet did not accept the package.'
+    foreach ($guidance in @($agents, $claude, $template)) {
+        Assert-True $guidance.Contains('release-recovery-vX.Y.Z') 'Shipped release guidance must direct post-pivot recovery to the immutable recovery artifact.'
+    }
+    Assert-True $workflow.Contains('Once NuGet accepts the package,') 'The workflow header must prohibit rebuilding as soon as the package is accepted.'
 
-    Invoke-ReleaseStateCase `
+    $firstRelease = Invoke-ReleaseStateCase `
         -Name 'first-release' `
         -Version '0.1.0' `
         -Tag 'v0.1.0' `
         -PreviousTag 'v0.0.0'
-    Invoke-ReleaseStateCase `
+    $subsequentRelease = Invoke-ReleaseStateCase `
         -Name 'subsequent-release' `
         -Version '1.2.4' `
         -Tag 'v1.2.4' `
         -PreviousTag 'v1.2.3'
+    Test-PackedReleaseState $subsequentRelease '1.2.4' 'v1.2.4'
 
     $missingCase = Join-Path $tempRoot 'missing-release-section'
     [IO.Directory]::CreateDirectory($missingCase) | Out-Null

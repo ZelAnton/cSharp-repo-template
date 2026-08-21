@@ -28,9 +28,10 @@ jobs:
       # Everything before it is cheap and reversible (build/test/pack, plus a LOCAL
       # commit+tag that is not yet pushed); everything after it (push the commit+tag
       # to main, create the GitHub Release) is reversible/recreatable and is made
-      # idempotent + retried. A failure before the pivot leaves no trace on the
-      # remote or registry — just re-run. A failure after the pivot is recoverable
-      # by re-run, EXCEPT once the tag is on main (see the Release step's note).
+      # idempotent + retried. A failure before NuGet accepts the package leaves no
+      # remote or registry trace and may be re-run. Once NuGet accepts the package,
+      # never re-run or rebuild this release, even if the tag push failed: recover
+      # only from this run's immutable release-recovery-vX.Y.Z artifact.
       #
       # The "Push the release commit + tag" step pushes straight to main. If you
       # protect main with a rule that requires pull requests or status checks, that
@@ -352,8 +353,8 @@ jobs:
 
       # Create the release commit and tag LOCALLY, but do NOT push yet: the push is
       # a VCS write and must happen AFTER the irreversible NuGet publish (the pivot
-      # below). Keeping it local means a failure before/at publish leaves nothing on
-      # the remote, so a fresh re-run starts clean.
+      # below). Keeping it local means a failure before NuGet accepts the package
+      # leaves nothing on the remote, so a fresh re-run starts clean.
       - name: Commit and tag the release (local only)
         env:
           RELEASE_AUTHOR_B64: '__AuthorBase64__'
@@ -384,8 +385,8 @@ jobs:
       # NuGet publishing cannot be undone (a pushed version can only be unlisted,
       # never re-pushed), so it is the pivot and every reversible action is ordered
       # around it. It runs BEFORE the git push and the GitHub Release: if it fails,
-      # no tag/commit has reached the remote and no Release exists, so a re-run is
-      # safe and recomputes the SAME version (the latest tag has not moved).
+      # no tag/commit has reached the remote and no Release exists. A new run is safe
+      # only if NuGet did not accept the package.
       # `--skip-duplicate` exits 0 when this exact version already exists on
       # nuget.org (HTTP 409), so an in-step retry remains safe if the registry
       # accepted a previous attempt but its response was lost. The loop retries
@@ -414,7 +415,9 @@ jobs:
             echo "::warning::NuGet push attempt $attempt failed; retrying after backoff..."
             sleep $((attempt * 15))
           done
-          echo "::error::NuGet push failed after 3 attempts. Nothing was pushed to the remote and no Release was created — it is safe to re-run this workflow."
+          echo "::error::NuGet push failed after 3 attempts. No VCS push or GitHub Release was attempted."
+          echo "::error::Before re-running, confirm this version is absent on nuget.org."
+          echo "::error::If NuGet accepted it, do not re-run or rebuild."
           exit 1
 
       # Reversible VCS write, AFTER the pivot. --atomic guarantees the branch and
