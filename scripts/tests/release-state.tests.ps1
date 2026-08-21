@@ -327,6 +327,8 @@ try {
     Assert-True $publishScript.Contains('write_output("acceptance", "rejected")') 'The NuGet pivot no longer records a confirmed terminal rejection.'
     Assert-True $publishScript.Contains('write_output("acceptance", "pre-existing")') 'The NuGet pivot no longer distinguishes a first-attempt duplicate from this run''s accepted package.'
     Assert-True $publishScript.Contains('if attempt > 1:') 'Duplicate idempotence is no longer limited to retries after this process has attempted the package.'
+    Assert-True $publishScript.Contains('if attempt > 1 and retry_duplicate.search(response):') 'A retry duplicate can again be mistaken for a direct upload by this run.'
+    Assert-True $publishScript.Contains('if attempt > 1 and not direct_upload_success.search(response):') 'A retry success without direct-upload evidence can again advance the release.'
     Assert-True $publishScript.Contains('timeout=300') 'The NuGet client attempt is no longer bounded before the job-level timeout.'
     Assert-True $publishScript.Contains('"./artifacts/*.nupkg"') 'The NuGet pivot no longer publishes the main package explicitly.'
     Assert-True $publishScript.Contains('"./artifacts/*.snupkg"') 'The NuGet pivot no longer publishes the symbol package explicitly.'
@@ -463,7 +465,7 @@ def duplicate_after_ambiguous_attempt(command, **kwargs):
 subprocess.run = duplicate_after_ambiguous_attempt
 time.sleep = lambda seconds: None
 '@
-    [void](Invoke-PythonBlock `
+    $retryDuplicateFailure = Invoke-PythonBlock `
         -WorkingDirectory $retryDuplicateCase `
         -ScriptName 'publish-retry-duplicate.py' `
         -Script $publishScript `
@@ -472,12 +474,18 @@ time.sleep = lambda seconds: None
             ATTEMPT_MARKER = $retryDuplicateAttemptPath
             GITHUB_OUTPUT = $retryDuplicateOutputPath
             NUGET_API_KEY = 'test-key-not-a-secret'
-        })
+        } `
+        -ExpectFailure
     $retryDuplicateOutputs = Read-GitHubOutputs $retryDuplicateOutputPath
-    Assert-Equal 'accepted' $retryDuplicateOutputs['acceptance'] 'A duplicate linked to this process''s ambiguous attempt did not preserve retry idempotence.'
-    Assert-Equal 'true' $retryDuplicateOutputs['recovery_required'] 'A successful post-attempt duplicate lost the post-pivot recovery state.'
+    $retryDuplicateRecoveryMarker = Join-Path $retryDuplicateCase 'artifacts/.nuget-recovery-required'
+    Assert-Equal 'ambiguous' $retryDuplicateOutputs['acceptance'] 'A retry duplicate was falsely accepted as a direct upload by this run.'
+    Assert-Equal 'true' $retryDuplicateOutputs['recovery_required'] 'A retry duplicate lost the exact recovery state needed for an ambiguous outcome.'
     Assert-Equal 'attempt=1;skip-duplicate=False|attempt=2;skip-duplicate=True' (([IO.File]::ReadAllLines($retryDuplicateAttemptPath)) -join '|') 'Duplicate-skipping was not confined to the retry after an ambiguous attempt.'
-    Write-Host 'PASS duplicate-after-ambiguous-attempt-is-idempotent'
+    Assert-True (Test-Path -LiteralPath $retryDuplicateRecoveryMarker -PathType Leaf) 'A retry duplicate removed the exact-recovery marker.'
+    Assert-RecoveryGuard 'failure' $retryDuplicateOutputs $retryDuplicateRecoveryMarker $true 'A retry duplicate would not preserve exact recovery state.'
+    Assert-True $retryDuplicateFailure.Contains('cannot be attributed to this run') 'A retry duplicate omitted the fail-closed ownership diagnostic.'
+    Assert-True $retryDuplicateFailure.Contains('No VCS push or GitHub Release was attempted') 'A retry duplicate did not terminate before tag and GitHub Release publication.'
+    Write-Host 'PASS duplicate-after-ambiguous-attempt-remains-recovery-only'
 
     $partialCase = Join-Path $tempRoot 'package-accepted-symbol-rejected'
     [IO.Directory]::CreateDirectory((Join-Path $partialCase 'artifacts')) | Out-Null

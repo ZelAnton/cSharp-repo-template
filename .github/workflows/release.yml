@@ -431,6 +431,16 @@ jobs:
               r"package version already exists)",
               re.IGNORECASE,
           )
+          retry_duplicate = re.compile(
+              r"(?:Response status code does not indicate success:\s*409\b|"
+              r"package(?:\s+version)?[^\r\n]*already exists|"
+              r"already exists[^\r\n]*skipping duplicate)",
+              re.IGNORECASE,
+          )
+          direct_upload_success = re.compile(
+              r"\byour package was pushed\b",
+              re.IGNORECASE,
+          )
 
           def write_output(name, value):
               with output_path.open("a", encoding="utf-8") as output:
@@ -473,8 +483,9 @@ jobs:
                   require_recovery(True)
               attempt_command = package_command
               if attempt > 1:
-                  # A duplicate is safe only after this process has made an
-                  # acceptance-ambiguous attempt for the same local package.
+                  # Retry only after this process made an acceptance-ambiguous
+                  # attempt. A skipped duplicate still cannot prove that this
+                  # process uploaded the occupied version.
                   attempt_command = [*package_command, "--skip-duplicate"]
               try:
                   result = subprocess.run(
@@ -493,13 +504,29 @@ jobs:
                   continue
 
               emit_process_output(result)
+              response = f"{result.stdout or ''}\n{result.stderr or ''}"
               if result.returncode == 0:
+                  if attempt > 1 and retry_duplicate.search(response):
+                      print(
+                          "::error::NuGet reported a duplicate on retry; the occupied "
+                          "version cannot be attributed to this run."
+                      )
+                      print(
+                          "::error::Acceptance remains ambiguous. Preserve this run's "
+                          "exact recovery state; do not create its tag or GitHub Release."
+                      )
+                      break
+                  if attempt > 1 and not direct_upload_success.search(response):
+                      print(
+                          "::error::NuGet retry exited successfully without direct-upload "
+                          "confirmation; acceptance remains ambiguous."
+                      )
+                      break
                   write_output("acceptance", "accepted")
                   package_accepted = True
                   print(f"NuGet package push succeeded (attempt {attempt}).")
                   break
 
-              response = f"{result.stdout or ''}\n{result.stderr or ''}"
               if attempt == 1 and pre_existing_version.search(response):
                   write_output("acceptance", "pre-existing")
                   require_recovery(False)
