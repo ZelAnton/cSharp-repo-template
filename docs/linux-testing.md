@@ -31,3 +31,8 @@ Useful switches:
 pwsh ./scripts/test-linux.ps1 -Filter "FullyQualifiedName~Greet"
 pwsh ./scripts/test-linux.ps1 -Configuration Debug -Rebuild
 ```
+
+`-Filter` is forwarded to `dotnet test --filter` as one literal argument. Quotes,
+backticks, `$()`, backslashes, and line breaks in the filter remain filter data;
+Bash does not evaluate them as shell syntax. `-Configuration` accepts `Debug` or
+`Release`, and `-Rebuild` adds `dotnet clean` before the normal build and test.

@@ -53,8 +53,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the version history.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build/test instructions and
-conventions. To report a security issue, follow [SECURITY.md](SECURITY.md) —
-please do not open a public issue.
+conventions. Windows developers can also run the suite in a Linux container;
+see [docs/linux-testing.md](docs/linux-testing.md) for the safe filtering and
+rebuild options. To report a security issue, follow [SECURITY.md](SECURITY.md)
+— please do not open a public issue.
 
 ## License
 
