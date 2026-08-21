@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All GitHub Actions are pinned to a commit SHA (with a version comment) instead of a moving tag; Dependabot now groups action bumps into a single weekly PR.
 
 ### Fixed
+- First-release changelog auto-fill now includes release-worthy changes from the repository's root commit.
 - Template initialization now rejects unsafe multiline or repository-owner metadata and preserves quoted, metacharacter-rich, or placeholder-like values without cascading replacements or release-workflow injection.
 - Linux container tests now pass filter expressions as literal arguments instead of allowing Bash to interpret filter text.
 - PowerShell template initialization now falls back to placeholder author details when Git or its configured identity is unavailable.
