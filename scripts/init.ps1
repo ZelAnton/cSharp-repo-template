@@ -6,8 +6,9 @@
 .DESCRIPTION
     Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
     __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder names, then
-    removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md, and,
-    unless -KeepScript, both initializers — this script and init.sh).
+    removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md,
+    scripts/tests/init-substitution.tests.ps1, and, unless -KeepScript, both
+    initializers — this script and init.sh).
 
     Run it once, right after creating a repository from the template:
 
@@ -21,16 +22,20 @@
     Letters, digits, underscores; dot-separated segments allowed (e.g. Acme.Widgets).
 
 .PARAMETER Author
-    Author for LICENSE and the .csproj. Defaults to `git config user.name`, else "Your Name".
+    Single-line author for LICENSE, the .csproj, and the release commit. Defaults
+    to `git config user.name`, else "Your Name".
 
 .PARAMETER AuthorEmail
-    Author email for the release commit. Defaults to `git config user.email`, else "you@example.com".
+    Single-line author email for the release commit. Defaults to
+    `git config user.email`, else "you@example.com".
 
 .PARAMETER GitHubOwner
-    GitHub owner/org used in repository URLs. Defaults to "your-org".
+    GitHub owner/org used in repository URLs. Must be a 1-39 character GitHub
+    account segment made of letters, digits, and non-edge hyphens. Defaults to
+    "your-org".
 
 .PARAMETER Description
-    Short package description. Defaults to "TODO: project description".
+    Single-line package description. Defaults to "TODO: project description".
 
 .PARAMETER Year
     Copyright year. Defaults to the current year.
@@ -70,16 +75,32 @@ if (-not $AuthorEmail) {
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
 if (-not $Description) { $Description = 'TODO: project description' }
 
+foreach ($field in @(
+    @{ Name = 'Author'; Value = $Author },
+    @{ Name = 'AuthorEmail'; Value = $AuthorEmail },
+    @{ Name = 'Description'; Value = $Description }
+)) {
+    if ($field.Value.Contains("`r") -or $field.Value.Contains("`n")) {
+        throw "Invalid -$($field.Name): line breaks are not allowed."
+    }
+}
+
+if ($GitHubOwner -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$') {
+    throw "Invalid -GitHubOwner '$GitHubOwner'. Use 1-39 letters, digits, or hyphens, with no leading or trailing hyphen."
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
 
 $replacements = [ordered]@{
-    '__ProjectName__' = $ProjectName
-    '__Author__'      = $Author
-    '__AuthorEmail__' = $AuthorEmail
-    '__GitHubOwner__' = $GitHubOwner
-    '__Description__' = $Description
-    '__Year__'        = "$Year"
+    '__ProjectName__'      = $ProjectName
+    '__Author__'           = $Author
+    '__AuthorEmail__'      = $AuthorEmail
+    '__AuthorBase64__'     = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Author))
+    '__AuthorEmailBase64__' = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($AuthorEmail))
+    '__GitHubOwner__'      = $GitHubOwner
+    '__Description__'      = $Description
+    '__Year__'             = "$Year"
 }
 
 # Values written into XML files (e.g. the .csproj <Authors>/<Description>) must be
@@ -89,6 +110,25 @@ foreach ($key in $replacements.Keys) {
     $xmlReplacements[$key] = $replacements[$key].Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
 }
 $xmlFileExtensions = @('.csproj', '.props', '.targets', '.slnx', '.config')
+$escapedTokens = @(
+    $replacements.Keys |
+        Sort-Object { $_.Length } -Descending |
+        ForEach-Object { [Text.RegularExpressions.Regex]::Escape($_) }
+)
+$tokenPattern = [Text.RegularExpressions.Regex]::new(
+    ($escapedTokens -join '|'),
+    [Text.RegularExpressions.RegexOptions]::CultureInvariant
+)
+
+function Replace-Tokens([string]$text, [Collections.IDictionary]$map) {
+    return $tokenPattern.Replace(
+        $text,
+        [Text.RegularExpressions.MatchEvaluator] {
+            param($match)
+            return [string]$map[$match.Value]
+        }
+    )
+}
 
 # Binary files carry no tokens; reading/rewriting them as text would corrupt them.
 # The template ships none, but a downstream user may add e.g. a strong-name key or
@@ -118,11 +158,8 @@ $contentChanged = 0
 foreach ($file in $files) {
     if ($binaryExtensions -contains $file.Extension) { continue }
     $text = [System.IO.File]::ReadAllText($file.FullName)
-    $new = $text
     $map = if ($xmlFileExtensions -contains $file.Extension) { $xmlReplacements } else { $replacements }
-    foreach ($key in $map.Keys) {
-        $new = $new.Replace($key, $map[$key])
-    }
+    $new = Replace-Tokens $text $map
     if ($new -ne $text) {
         [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
         $contentChanged++
@@ -153,7 +190,8 @@ if (Test-Path $claudeTemplate) {
 #    template, not after it has been stamped into a concrete project.
 $templateOnly = @(
     (Join-Path $repoRoot 'TEMPLATE.md'),
-    (Join-Path $repoRoot 'docs/AGENT-INIT-GUIDE.md')
+    (Join-Path $repoRoot 'docs/AGENT-INIT-GUIDE.md'),
+    (Join-Path $repoRoot 'scripts/tests/init-substitution.tests.ps1')
 )
 foreach ($path in $templateOnly) {
     if (Test-Path -LiteralPath $path) {
@@ -167,6 +205,11 @@ $docsDir = Join-Path $repoRoot 'docs'
 if ((Test-Path -LiteralPath $docsDir) -and -not (Get-ChildItem -LiteralPath $docsDir -Force)) {
     Remove-Item -LiteralPath $docsDir -Force
     Write-Host "    Removed docs" -ForegroundColor DarkGray
+}
+$scriptTestsDir = Join-Path $repoRoot 'scripts/tests'
+if ((Test-Path -LiteralPath $scriptTestsDir) -and -not (Get-ChildItem -LiteralPath $scriptTestsDir -Force)) {
+    Remove-Item -LiteralPath $scriptTestsDir -Force
+    Write-Host "    Removed scripts/tests" -ForegroundColor DarkGray
 }
 
 Write-Host ""

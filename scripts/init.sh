@@ -6,8 +6,8 @@
 # Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
 # __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder
 # names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md) and — unless --keep-script — both initializers
-# (init.sh and init.ps1).
+# docs/AGENT-INIT-GUIDE.md, scripts/tests/init-substitution.tests.ps1) and —
+# unless --keep-script — both initializers (init.sh and init.ps1).
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name Acme.Widgets \
@@ -16,16 +16,11 @@
 #       [--year 2026] [--keep-script]
 #
 # --project-name is required; the rest fall back to sensible defaults so the
-# result always builds. Edit LICENSE / the .csproj afterwards to refine them.
+# result always builds. Author, author-email, and description must be single-line;
+# GitHub owner must be a valid account-path segment. Edit LICENSE / the .csproj
+# afterwards to refine them.
 
 set -euo pipefail
-
-# bash 5.2+ treats a literal '&' in the replacement of ${var//pat/repl} as the
-# matched text (the patsub_replacement option). Our XML-escaped values contain
-# '&amp;', so leaving it on would corrupt them ('&' -> the matched token). Turn it
-# off so '&' is substituted literally. No-op / harmless on older bash where '&'
-# was always literal.
-shopt -u patsub_replacement 2>/dev/null || true
 
 project_name=""
 author=""
@@ -85,6 +80,19 @@ fi
 [ -n "$description" ]  || description="TODO: project description"
 [ -n "$year" ]         || year="$(date +%Y)"
 
+case "$author" in
+  *$'\r'*|*$'\n'*) die "invalid --author: line breaks are not allowed." ;;
+esac
+case "$author_email" in
+  *$'\r'*|*$'\n'*) die "invalid --author-email: line breaks are not allowed." ;;
+esac
+case "$description" in
+  *$'\r'*|*$'\n'*) die "invalid --description: line breaks are not allowed." ;;
+esac
+if [[ ! "$github_owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+  die "invalid --github-owner '$github_owner'. Use 1-39 letters, digits, or hyphens, with no leading or trailing hyphen."
+fi
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
@@ -100,6 +108,37 @@ author_email_x="$(xml_escape "$author_email")"
 owner_x="$(xml_escape "$github_owner")"
 desc_x="$(xml_escape "$description")"
 year_x="$(xml_escape "$year")"
+author_b64="$(printf '%s' "$author" | base64 | tr -d '\r\n')"
+author_email_b64="$(printf '%s' "$author_email" | base64 | tr -d '\r\n')"
+
+token_pattern='(__ProjectName__|__AuthorEmailBase64__|__AuthorBase64__|__AuthorEmail__|__Author__|__GitHubOwner__|__Description__|__Year__)'
+
+replace_tokens() {
+  local content="$1"
+  local mode="$2"
+  local rest="$content"
+  local output=""
+  local token prefix replacement
+
+  while [[ "$rest" =~ $token_pattern ]]; do
+    token="${BASH_REMATCH[1]}"
+    prefix="${rest%%"$token"*}"
+    output+="$prefix"
+    case "$token" in
+      __ProjectName__)      if [ "$mode" = xml ]; then replacement="$project_x"; else replacement="$project_name"; fi ;;
+      __Author__)           if [ "$mode" = xml ]; then replacement="$author_x"; else replacement="$author"; fi ;;
+      __AuthorEmail__)      if [ "$mode" = xml ]; then replacement="$author_email_x"; else replacement="$author_email"; fi ;;
+      __AuthorBase64__)     replacement="$author_b64" ;;
+      __AuthorEmailBase64__) replacement="$author_email_b64" ;;
+      __GitHubOwner__)      if [ "$mode" = xml ]; then replacement="$owner_x"; else replacement="$github_owner"; fi ;;
+      __Description__)      if [ "$mode" = xml ]; then replacement="$desc_x"; else replacement="$description"; fi ;;
+      __Year__)             if [ "$mode" = xml ]; then replacement="$year_x"; else replacement="$year"; fi ;;
+    esac
+    output+="$replacement"
+    rest="${rest#*"$token"}"
+  done
+  printf '%s%s' "$output" "$rest"
+}
 
 echo "==> Initializing template as '$project_name'"
 
@@ -120,19 +159,14 @@ while IFS= read -r -d '' file; do
   esac
   case "$file" in
     *.csproj|*.props|*.targets|*.slnx|*.config)
-      p=$project_x; a=$author_x; ae=$author_email_x; o=$owner_x; d=$desc_x; y=$year_x ;;
+      mode=xml ;;
     *)
-      p=$project_name; a=$author; ae=$author_email; o=$github_owner; d=$description; y=$year ;;
+      mode=raw ;;
   esac
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
   orig="$content"
-  content="${content//__ProjectName__/$p}"
-  content="${content//__Author__/$a}"
-  content="${content//__AuthorEmail__/$ae}"
-  content="${content//__GitHubOwner__/$o}"
-  content="${content//__Description__/$d}"
-  content="${content//__Year__/$y}"
+  content="$(replace_tokens "$content" "$mode"; printf x)"; content="${content%x}"
   if [ "$content" != "$orig" ]; then
     printf '%s' "$content" > "$file"
     changed=$((changed + 1))
@@ -165,9 +199,13 @@ fi
 
 # 4) Remove template-only files — documentation that only applies while this is a
 #    template, not after it has been stamped into a concrete project.
-rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md"
+rm -f \
+  "$repo_root/TEMPLATE.md" \
+  "$repo_root/docs/AGENT-INIT-GUIDE.md" \
+  "$repo_root/scripts/tests/init-substitution.tests.ps1"
 # Drop docs/ if it's now empty (it usually isn't — linux-testing.md also lives here).
 rmdir "$repo_root/docs" 2>/dev/null || true
+rmdir "$repo_root/scripts/tests" 2>/dev/null || true
 
 echo ""
 echo "Done. Next steps:"

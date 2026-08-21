@@ -351,10 +351,15 @@ jobs:
       # below). Keeping it local means a failure before/at publish leaves nothing on
       # the remote, so a fresh re-run starts clean.
       - name: Commit and tag the release (local only)
+        env:
+          RELEASE_AUTHOR_B64: __AuthorBase64__
+          RELEASE_AUTHOR_EMAIL_B64: __AuthorEmailBase64__
         run: |
           set -euo pipefail
-          git config user.name "__Author__"
-          git config user.email "__AuthorEmail__"
+          release_author="$(printf '%s' "$RELEASE_AUTHOR_B64" | base64 --decode)"
+          release_author_email="$(printf '%s' "$RELEASE_AUTHOR_EMAIL_B64" | base64 --decode)"
+          git config user.name "$release_author"
+          git config user.email "$release_author_email"
           git add src/__ProjectName__/__ProjectName__.csproj CHANGELOG.md
           git commit -m "Release ${{ steps.version.outputs.tag }}"
           git tag "${{ steps.version.outputs.tag }}"

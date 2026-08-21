@@ -18,6 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All GitHub Actions are pinned to a commit SHA (with a version comment) instead of a moving tag; Dependabot now groups action bumps into a single weekly PR.
 
 ### Fixed
--
+- Template initialization now rejects unsafe multiline or repository-owner metadata and preserves quoted, metacharacter-rich, or placeholder-like values without cascading replacements or release-workflow injection.
 
 [Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/main

@@ -44,22 +44,39 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    `-ProjectName` / `--project-name` is required; the rest are optional and fall
    back to sensible defaults (`git config user.name`, `git config user.email`,
    `your-org`, a TODO description, the current year). The script:
-   - replaces the placeholder tokens in every file's contents (XML-escaping the
-     values written into `.csproj`/`.slnx`/`.props`/`.targets`/`.config` files);
+   - validates all metadata before writing: author, author email, and description
+     must be single-line; GitHub owner must be 1-39 letters, digits, or hyphens,
+     with no leading or trailing hyphen;
+   - replaces all placeholder tokens in one pass, so placeholder-like text inside
+     a supplied value stays literal and does not trigger another replacement;
+   - preserves quotes, backslashes, and shell/Python metacharacters as data,
+     XML-escapes values written into XML project files, and safely serializes the
+     release-commit identity before the workflow passes it to Bash;
    - renames the token-named files and folders (`src/__ProjectName__`,
      `tests/__ProjectName__.Tests`, the `.csproj`/`.slnx`/`.sln.DotSettings`);
    - activates `.claude/settings.json` from its shipped `.template` form
      (sane shared permissions for `dotnet` commands);
-   - deletes this `TEMPLATE.md` and the `docs/AGENT-INIT-GUIDE.md`, and (unless
-     `-KeepScript` / `--keep-script`) removes **both** initializers — it deletes
-     itself *and* its sibling, so a generated repo ships neither `init.ps1` nor
-     `init.sh`.
+   - deletes this `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, and the template-only
+     `scripts/tests/init-substitution.tests.ps1`; unless `-KeepScript` /
+     `--keep-script` is set, it also removes **both** initializers — itself and its
+     sibling — so a generated repo ships neither `init.ps1` nor `init.sh`.
 4. Verify:
 
    ```pwsh
    dotnet build Acme.Widgets.slnx
    dotnet test  Acme.Widgets.slnx
    ```
+
+   Template maintainers can reproduce the cross-shell hostile-input, syntax,
+   build, and NUnit regression before initialization:
+
+   ```pwsh
+   pwsh ./scripts/tests/init-substitution.tests.ps1
+   ```
+
+   The regression requires PowerShell 7, Bash, Python with PyYAML or `yamllint`,
+   and the .NET SDK pinned by `global.json`. It runs entirely in a temporary
+   directory and removes that directory on completion.
 
 5. Replace the placeholder `Greeter` type in `src/...` with your real API and
    delete the sample test.
@@ -95,10 +112,10 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 | Token | Meaning |
 |---|---|
 | `__ProjectName__` | project / namespace / assembly / package id + file & folder names |
-| `__Author__` | author (LICENSE, `<Authors>`, `<Copyright>`) |
-| `__AuthorEmail__` | author email (release-commit identity in `release.yml`) |
-| `__GitHubOwner__` | GitHub owner/org in repository URLs |
-| `__Description__` | package description |
+| `__Author__` | single-line author (LICENSE, `<Authors>`, `<Copyright>`, release identity) |
+| `__AuthorEmail__` | single-line author email (release-commit identity in `release.yml`) |
+| `__GitHubOwner__` | 1-39 character GitHub owner/org path segment in repository URLs |
+| `__Description__` | single-line package description |
 | `__Year__` | copyright year |
 
 ## Optional pieces — remove what you don't need

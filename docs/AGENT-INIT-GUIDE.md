@@ -71,8 +71,13 @@ assumptions a past agent got wrong:
    pwsh ./scripts/init.ps1 -ProjectName Acme.Widgets -Author "Jane Doe" -GitHubOwner acme -Description "Widget toolkit"
    ```
 
-   `-ProjectName` is required; the rest fall back to sensible defaults. The
-   script substitutes tokens, renames files/folders, activates
+   `-ProjectName` is required; the rest fall back to sensible defaults. Author,
+   author email, and description must be single-line; GitHub owner must be 1-39
+   letters, digits, or hyphens with no leading or trailing hyphen. Quotes,
+   backslashes, shell/Python metacharacters, and placeholder-like text are safe:
+   replacement is one pass, XML destinations are escaped, and the workflow
+   identity is serialized before Bash receives it. Validation happens before any
+   file is changed. The script substitutes tokens, renames files/folders, activates
    `.claude/settings.json` from its `.template`, and deletes `TEMPLATE.md` (and
    itself unless `-KeepScript`).
 4. **Verify**:
@@ -81,6 +86,18 @@ assumptions a past agent got wrong:
    dotnet build Acme.Widgets.slnx
    dotnet test  Acme.Widgets.slnx
    ```
+
+   Template maintainers can verify both initializers against equivalent hostile
+   inputs, generated-file syntax, build, and real NUnit discovery with:
+
+   ```pwsh
+   pwsh ./scripts/tests/init-substitution.tests.ps1
+   ```
+
+   This requires PowerShell 7, Bash, Python with PyYAML or `yamllint`, and the
+   pinned .NET SDK. The test uses and cleans a temporary directory outside the
+   checkout; the initializer removes the template-only regression script from a
+   generated repository.
 5. Replace the placeholder `Greeter` type with the real API, delete the sample
    test, fill in the `CLAUDE.md` "Architecture" section, and work through the
    `TEMPLATE.md` post-setup checklist.
@@ -228,6 +245,15 @@ wrong or obsolete.
 ## Failure log
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
+
+### 2026-08-21 — Metadata could cascade or enter the release shell as code
+- **Symptom:** Quotes, shell metacharacters, line breaks, or another placeholder
+  inside init metadata could change generated files or the release workflow.
+- **Root cause:** Both initializers replaced tokens sequentially and wrote raw
+  release identity values directly into a Bash `run` block.
+- **Rule:** Validate context-limited values before writing, replace original tokens
+  in one pass, and transfer release identity through a non-executable serialization;
+  keep `scripts/tests/init-substitution.tests.ps1` green for both initializers.
 
 ### 2026-05-29 — Generated ~30 files against an imagined layout
 - **Symptom:** Created csproj/test files assuming a multi-project, xUnit, net9,
