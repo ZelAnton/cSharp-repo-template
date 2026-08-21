@@ -65,17 +65,26 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-$bashLines = @('set -e')
-if ($Rebuild) {
-    $bashLines += "dotnet clean -c $Configuration"
-}
-$bashLines += "dotnet build -c $Configuration"
-$testCmd = "dotnet test --no-build -c $Configuration tests/__ProjectName__.Tests/__ProjectName__.Tests.csproj"
-if ($Filter) {
-    $testCmd += " --filter `"$Filter`""
-}
-$bashLines += $testCmd
-$bashScript = $bashLines -join "`n"
+$bashScript = @'
+set -e
+configuration=$1
+rebuild=$2
+has_filter=$3
+filter=$4
+
+if [ "$rebuild" = '1' ]; then
+    dotnet clean -c "$configuration"
+fi
+
+dotnet build -c "$configuration"
+test_args=(test --no-build -c "$configuration" tests/__ProjectName__.Tests/__ProjectName__.Tests.csproj)
+if [ "$has_filter" = '1' ]; then
+    test_args+=(--filter "$filter")
+fi
+dotnet "${test_args[@]}"
+'@
+$rebuildFlag = if ($Rebuild) { '1' } else { '0' }
+$filterFlag = if ($Filter) { '1' } else { '0' }
 
 # Anonymous volumes shadow the host bin/obj folders inside the container so
 # Windows IDE artifacts cannot leak into the Linux build, and the Linux build
@@ -102,7 +111,7 @@ $dockerArgs += @(
     '-e', 'DOTNET_CLI_TELEMETRY_OPTOUT=1',
     '-e', 'DOTNET_NOLOGO=1',
     $Image,
-    'bash', '-c', $bashScript
+    'bash', '-c', $bashScript, 'test-linux', $Configuration, $rebuildFlag, $filterFlag, $Filter
 )
 
 Write-Host "==> Running tests in $Image" -ForegroundColor DarkGray
