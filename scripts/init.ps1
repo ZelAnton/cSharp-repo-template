@@ -197,6 +197,109 @@ function Test-SamePlanPath([string]$left, [string]$right) {
     return [string]::Equals($left, $right, $comparison)
 }
 
+function Assert-NoReparsePoint([pscustomobject]$path, [string]$role) {
+    $current = $repoRoot
+    foreach ($segment in $path.Relative.Split('/')) {
+        $current = Join-Path $current $segment
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Unsafe reparse point in $role path '$($path.Relative)'. No files were changed."
+        }
+    }
+}
+
+function Assert-FileCanBeChanged([pscustomobject]$path, [string]$role) {
+    $attributes = [IO.File]::GetAttributes($path.FullPath)
+    if ($attributes -band [IO.FileAttributes]::ReadOnly) {
+        throw "$role path is read-only: $($path.Relative). No files were changed."
+    }
+
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($path.FullPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    }
+    catch {
+        throw "$role path is not writable: $($path.Relative). No files were changed."
+    }
+    finally {
+        if ($stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Assert-DirectoryCanBeChanged([string]$fullPath, [string]$relative, [string]$role) {
+    $current = $fullPath
+    while (-not (Test-Path -LiteralPath $current)) {
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or (Test-SamePlanPath $parent $current)) {
+            throw "$role parent cannot be resolved: $relative. No files were changed."
+        }
+        $current = $parent
+    }
+
+    if (-not (Test-Path -LiteralPath $current -PathType Container)) {
+        throw "$role parent is not a directory: $relative. No files were changed."
+    }
+
+    $item = Get-Item -LiteralPath $current -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) {
+        throw "$role parent is read-only: $relative. No files were changed."
+    }
+
+    if ($IsWindows) {
+        try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $identitySids = @($identity.User.Value) + @($identity.Groups | ForEach-Object Value)
+            $rules = (Get-Acl -LiteralPath $current).GetAccessRules(
+                $true,
+                $true,
+                [Security.Principal.SecurityIdentifier]
+            )
+            $mutationRights =
+                [Security.AccessControl.FileSystemRights]::Write -bor
+                [Security.AccessControl.FileSystemRights]::Modify -bor
+                [Security.AccessControl.FileSystemRights]::FullControl -bor
+                [Security.AccessControl.FileSystemRights]::Delete -bor
+                [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles
+            $allowed = $false
+            foreach ($rule in $rules | Where-Object { $identitySids -contains $_.IdentityReference.Value }) {
+                if (($rule.FileSystemRights -band $mutationRights) -eq 0) {
+                    continue
+                }
+                if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny) {
+                    throw "$role parent denies mutation access: $relative. No files were changed."
+                }
+                $allowed = $true
+            }
+            if (-not $allowed) {
+                throw "$role parent does not grant mutation access: $relative. No files were changed."
+            }
+        }
+        catch {
+            if ($_.Exception.Message -match 'No files were changed\.$') {
+                throw
+            }
+            throw "$role parent permissions cannot be validated: $relative. No files were changed."
+        }
+    }
+    else {
+        $mode = [IO.File]::GetUnixFileMode($current)
+        $writeModes =
+            [IO.UnixFileMode]::UserWrite -bor
+            [IO.UnixFileMode]::GroupWrite -bor
+            [IO.UnixFileMode]::OtherWrite
+        if (($mode -band $writeModes) -eq 0) {
+            throw "$role parent is not writable: $relative. No files were changed."
+        }
+    }
+}
+
+Assert-NoReparsePoint ([pscustomobject]@{
+    Relative = 'scripts/init-plan.tsv'
+    FullPath = $planPath
+}) 'plan'
+
 $plan = @()
 $lineNumber = 0
 foreach ($line in [IO.File]::ReadAllLines($planPath)) {
@@ -229,6 +332,11 @@ if (-not $plan) {
 $contentWrites = @()
 $plannedDestinations = @{}
 foreach ($operation in $plan) {
+    Assert-NoReparsePoint $operation.Source 'source'
+    if ($operation.Destination) {
+        Assert-NoReparsePoint $operation.Destination 'destination'
+    }
+
     $sourceExists = Test-Path -LiteralPath $operation.Source.FullPath
     switch ($operation.Kind) {
         'content' {
@@ -244,6 +352,7 @@ foreach ($operation in $plan) {
             $map = if ($xmlFileExtensions -contains $extension) { $xmlReplacements } else { $replacements }
             $newText = Replace-Tokens $text $map
             if ($newText -cne $text) {
+                Assert-FileCanBeChanged $operation.Source 'Template content'
                 $contentWrites += [pscustomobject]@{
                     Path = $operation.Source
                     Content = $newText
@@ -266,6 +375,7 @@ foreach ($operation in $plan) {
             if ($plannedDestinations.ContainsKey($operation.Destination.FullPath)) {
                 throw "Duplicate initialization target: $($operation.Destination.Relative). No files were changed."
             }
+            Assert-DirectoryCanBeChanged (Split-Path -Parent $operation.Destination.FullPath) $operation.Destination.Relative 'Initialization target'
             $plannedDestinations[$operation.Destination.FullPath] = $operation.Source.Relative
         }
         { $_ -in @('move', 'activate') } {
@@ -289,11 +399,17 @@ foreach ($operation in $plan) {
             if ((Test-Path -LiteralPath $destinationParent) -and -not (Test-Path -LiteralPath $destinationParent -PathType Container)) {
                 throw "Initialization target parent is not a directory: $($operation.Destination.Relative). No files were changed."
             }
+            Assert-DirectoryCanBeChanged $destinationParent $operation.Destination.Relative 'Initialization target'
+            Assert-DirectoryCanBeChanged (Split-Path -Parent $operation.Source.FullPath) $operation.Source.Relative 'Template move source'
             $plannedDestinations[$operation.Destination.FullPath] = $operation.Source.Relative
         }
         'remove' {
             if ($sourceExists -and -not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf)) {
                 throw "Template-only removal path is not a file: $($operation.Source.Relative). No files were changed."
+            }
+            if ($sourceExists) {
+                Assert-FileCanBeChanged $operation.Source 'Template-only removal'
+                Assert-DirectoryCanBeChanged (Split-Path -Parent $operation.Source.FullPath) $operation.Source.Relative 'Template-only removal'
             }
         }
     }
@@ -302,55 +418,174 @@ foreach ($operation in $plan) {
 Write-Host "==> Initializing template as '$ProjectName'" -ForegroundColor Cyan
 Write-Host "    Preflight validated $($plan.Count) template-owned operation(s)." -ForegroundColor DarkGray
 
+$stagingRoot = Join-Path ([IO.Path]::GetTempPath()) "csharp-template-init-$([Guid]::NewGuid().ToString('N'))"
+$backupRecords = @()
+$completedMoves = @()
+$createdDirectories = @()
+$removedDirectories = @()
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
-foreach ($write in $contentWrites) {
-    [IO.File]::WriteAllText($write.Path.FullPath, $write.Content, $utf8NoBom)
-}
-Write-Host "    Updated contents in $($contentWrites.Count) file(s)." -ForegroundColor DarkGray
 
-# Destination directories are created empty; only listed files move into them.
-# Unknown files inside token-named source directories stay at their original paths.
-foreach ($operation in $plan | Where-Object Kind -eq 'directory') {
-    if (
-        (Test-Path -LiteralPath $operation.Source.FullPath -PathType Container) -and
-        -not (Test-SamePlanPath $operation.Source.FullPath $operation.Destination.FullPath)
-    ) {
-        [IO.Directory]::CreateDirectory($operation.Destination.FullPath) | Out-Null
+try {
+    [IO.Directory]::CreateDirectory($stagingRoot) | Out-Null
+    $backupPaths = [Collections.Generic.List[string]]::new()
+    foreach ($write in $contentWrites) {
+        $backupPaths.Add($write.Path.FullPath)
+    }
+    foreach ($operation in $plan | Where-Object Kind -eq 'remove') {
+        if (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf) {
+            $backupPaths.Add($operation.Source.FullPath)
+        }
+    }
+    if (-not $KeepScript) {
+        foreach ($initializer in @((Join-Path $PSScriptRoot 'init.sh'), $selfPath)) {
+            if (Test-Path -LiteralPath $initializer -PathType Leaf) {
+                $backupPaths.Add($initializer)
+            }
+        }
+    }
+
+    $backedUp = [Collections.Generic.HashSet[string]]::new($(if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
+    foreach ($original in $backupPaths) {
+        if (-not $backedUp.Add($original)) {
+            continue
+        }
+        $item = Get-Item -LiteralPath $original -Force
+        $backup = Join-Path $stagingRoot "$($backupRecords.Count).bak"
+        [IO.File]::Copy($original, $backup, $false)
+        $backupRecords += [pscustomobject]@{
+            Original = $original
+            Backup = $backup
+            Attributes = $item.Attributes
+            LastWriteTimeUtc = $item.LastWriteTimeUtc
+        }
+    }
+
+    foreach ($write in $contentWrites) {
+        Assert-NoReparsePoint $write.Path 'content source'
+        [IO.File]::WriteAllText($write.Path.FullPath, $write.Content, $utf8NoBom)
+    }
+    Write-Host "    Updated contents in $($contentWrites.Count) file(s)." -ForegroundColor DarkGray
+
+    # Destination directories are created empty; only listed files move into them.
+    # Unknown files inside token-named source directories stay at their original paths.
+    foreach ($operation in $plan | Where-Object Kind -eq 'directory') {
+        if (
+            (Test-Path -LiteralPath $operation.Source.FullPath -PathType Container) -and
+            -not (Test-SamePlanPath $operation.Source.FullPath $operation.Destination.FullPath)
+        ) {
+            Assert-NoReparsePoint $operation.Source 'directory source'
+            Assert-NoReparsePoint $operation.Destination 'directory destination'
+            $createdDirectories += $operation.Destination.FullPath
+            [IO.Directory]::CreateDirectory($operation.Destination.FullPath) | Out-Null
+        }
+    }
+
+    foreach ($operation in $plan | Where-Object Kind -in @('move', 'activate')) {
+        if (
+            (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf) -and
+            -not (Test-SamePlanPath $operation.Source.FullPath $operation.Destination.FullPath)
+        ) {
+            Assert-NoReparsePoint $operation.Source 'move source'
+            Assert-NoReparsePoint $operation.Destination 'move destination'
+            $completedMoves += $operation
+            Move-Item -LiteralPath $operation.Source.FullPath -Destination $operation.Destination.FullPath
+            Write-Host "    Moved $($operation.Source.Relative) -> $($operation.Destination.Relative)" -ForegroundColor DarkGray
+        }
+    }
+
+    foreach ($operation in $plan | Where-Object Kind -eq 'remove') {
+        if (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf) {
+            Assert-NoReparsePoint $operation.Source 'removal source'
+            Remove-Item -LiteralPath $operation.Source.FullPath -Force
+            Write-Host "    Removed $($operation.Source.Relative)" -ForegroundColor DarkGray
+        }
+    }
+
+    $directoryOperations = @($plan | Where-Object Kind -eq 'directory')
+    [array]::Reverse($directoryOperations)
+    foreach ($operation in $directoryOperations) {
+        if (
+            (Test-Path -LiteralPath $operation.Source.FullPath -PathType Container) -and
+            -not (Get-ChildItem -LiteralPath $operation.Source.FullPath -Force)
+        ) {
+            Assert-NoReparsePoint $operation.Source 'directory cleanup source'
+            $removedDirectories += $operation.Source.FullPath
+            Remove-Item -LiteralPath $operation.Source.FullPath -Force
+        }
+    }
+
+    foreach ($relativeDirectory in @('docs', 'scripts/tests')) {
+        $directory = Join-Path $repoRoot $relativeDirectory
+        if ((Test-Path -LiteralPath $directory -PathType Container) -and -not (Get-ChildItem -LiteralPath $directory -Force)) {
+            Assert-NoReparsePoint ([pscustomobject]@{ Relative = $relativeDirectory; FullPath = $directory }) 'directory cleanup source'
+            $removedDirectories += $directory
+            Remove-Item -LiteralPath $directory -Force
+        }
+    }
+
+    if (-not $KeepScript) {
+        foreach ($initializer in @((Join-Path $PSScriptRoot 'init.sh'), $selfPath)) {
+            if (Test-Path -LiteralPath $initializer -PathType Leaf) {
+                Remove-Item -LiteralPath $initializer -Force
+            }
+        }
     }
 }
-
-foreach ($operation in $plan | Where-Object Kind -in @('move', 'activate')) {
-    if (
-        (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf) -and
-        -not (Test-SamePlanPath $operation.Source.FullPath $operation.Destination.FullPath)
-    ) {
-        Move-Item -LiteralPath $operation.Source.FullPath -Destination $operation.Destination.FullPath
-        Write-Host "    Moved $($operation.Source.Relative) -> $($operation.Destination.Relative)" -ForegroundColor DarkGray
+catch {
+    $mutationError = $_
+    $rollbackErrors = [Collections.Generic.List[string]]::new()
+    foreach ($directory in $removedDirectories) {
+        try {
+            [IO.Directory]::CreateDirectory($directory) | Out-Null
+        }
+        catch {
+            $rollbackErrors.Add($_.Exception.Message)
+        }
     }
-}
-
-foreach ($operation in $plan | Where-Object Kind -eq 'remove') {
-    if (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf) {
-        Remove-Item -LiteralPath $operation.Source.FullPath -Force
-        Write-Host "    Removed $($operation.Source.Relative)" -ForegroundColor DarkGray
+    [array]::Reverse($completedMoves)
+    foreach ($operation in $completedMoves) {
+        try {
+            if ((Test-Path -LiteralPath $operation.Destination.FullPath) -and -not (Test-Path -LiteralPath $operation.Source.FullPath)) {
+                Move-Item -LiteralPath $operation.Destination.FullPath -Destination $operation.Source.FullPath
+            }
+        }
+        catch {
+            $rollbackErrors.Add($_.Exception.Message)
+        }
     }
-}
-
-$directoryOperations = @($plan | Where-Object Kind -eq 'directory')
-[array]::Reverse($directoryOperations)
-foreach ($operation in $directoryOperations) {
-    if (
-        (Test-Path -LiteralPath $operation.Source.FullPath -PathType Container) -and
-        -not (Get-ChildItem -LiteralPath $operation.Source.FullPath -Force)
-    ) {
-        Remove-Item -LiteralPath $operation.Source.FullPath -Force
+    foreach ($backup in $backupRecords) {
+        try {
+            $existing = Get-Item -LiteralPath $backup.Original -Force -ErrorAction SilentlyContinue
+            if ($existing -and ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                Remove-Item -LiteralPath $backup.Original -Force
+            }
+            [IO.File]::Copy($backup.Backup, $backup.Original, $true)
+            [IO.File]::SetAttributes($backup.Original, $backup.Attributes)
+            [IO.File]::SetLastWriteTimeUtc($backup.Original, $backup.LastWriteTimeUtc)
+        }
+        catch {
+            $rollbackErrors.Add($_.Exception.Message)
+        }
     }
+    [array]::Reverse($createdDirectories)
+    foreach ($directory in $createdDirectories) {
+        try {
+            if ((Test-Path -LiteralPath $directory -PathType Container) -and -not (Get-ChildItem -LiteralPath $directory -Force)) {
+                Remove-Item -LiteralPath $directory -Force
+            }
+        }
+        catch {
+            $rollbackErrors.Add($_.Exception.Message)
+        }
+    }
+    if ($rollbackErrors.Count -gt 0) {
+        throw "Initialization failed and rollback was incomplete: $($mutationError.Exception.Message) Rollback errors: $($rollbackErrors -join '; ')"
+    }
+    throw "Initialization failed; all changes were rolled back: $($mutationError.Exception.Message)"
 }
-
-foreach ($relativeDirectory in @('docs', 'scripts/tests')) {
-    $directory = Join-Path $repoRoot $relativeDirectory
-    if ((Test-Path -LiteralPath $directory -PathType Container) -and -not (Get-ChildItem -LiteralPath $directory -Force)) {
-        Remove-Item -LiteralPath $directory -Force
+finally {
+    if (Test-Path -LiteralPath $stagingRoot) {
+        Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -362,12 +597,3 @@ Write-Host "  3. Review LICENSE (author/year) and the .csproj package metadata."
 Write-Host "  4. NuGet publishing: add the NUGET_API_KEY repo secret, or delete"
 Write-Host "     .github/workflows/release.yml and the packaging properties in the .csproj."
 Write-Host "  5. Commit the initialized project."
-
-# Remove both initializers unless asked to keep them.
-if (-not $KeepScript) {
-    $siblingSh = Join-Path $PSScriptRoot 'init.sh'
-    if (Test-Path -LiteralPath $siblingSh) {
-        Remove-Item -LiteralPath $siblingSh -Force
-    }
-    Remove-Item -LiteralPath $selfPath -Force
-}

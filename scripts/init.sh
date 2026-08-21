@@ -20,7 +20,7 @@
 # GitHub owner must be a valid account-path segment. Edit LICENSE / the .csproj
 # afterwards to refine them.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 project_name=""
 author=""
@@ -93,8 +93,8 @@ if [[ ! "$github_owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; the
   die "invalid --github-owner '$github_owner'. Use 1-39 letters, digits, or hyphens, with no leading or trailing hyphen."
 fi
 
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
+script_dir="$(cd -P "$(dirname "$0")" && pwd -P)"
+repo_root="$(cd -P "$script_dir/.." && pwd -P)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
 
@@ -154,6 +154,36 @@ resolve_plan_path() {
 }
 
 path_exists() { [ -e "$1" ] || [ -L "$1" ]; }
+is_link_or_reparse() { [ -L "$1" ] || [ -n "$(readlink "$1" 2>/dev/null || true)" ]; }
+
+assert_no_link_components() {
+  local relative="$1"
+  local role="$2"
+  local current="$repo_root"
+  local component
+  local -a components=()
+  IFS='/' read -ra components <<< "$relative"
+  for component in "${components[@]}"; do
+    current="$current/$component"
+    ! is_link_or_reparse "$current" || die "unsafe symbolic link or reparse point in $role path '$relative'. No files were changed."
+  done
+}
+
+assert_changeable_parent() {
+  local path="$1"
+  local relative="$2"
+  local role="$3"
+  local parent
+  parent="$(dirname "$path")"
+  while ! path_exists "$parent"; do
+    [ "$parent" != "$repo_root" ] || break
+    parent="$(dirname "$parent")"
+  done
+  [ -d "$parent" ] || die "$role parent is not a directory: $relative. No files were changed."
+  [ -w "$parent" ] || die "$role parent is not writable: $relative. No files were changed."
+}
+
+assert_no_link_components "scripts/init-plan.tsv" "plan"
 
 declare -a plan_kinds=()
 declare -a plan_sources=()
@@ -218,6 +248,11 @@ for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
     destination="$repo_root/$destination_relative"
   fi
 
+  assert_no_link_components "$source_relative" "source"
+  if [ -n "$destination_relative" ]; then
+    assert_no_link_components "$destination_relative" "destination"
+  fi
+
   case "$kind" in
     content)
       path_exists "$source" || continue
@@ -229,6 +264,7 @@ for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
       content="$(cat "$source"; printf x)"; content="${content%x}"
       transformed="$(replace_tokens "$content" "$mode"; printf x)"; transformed="${transformed%x}"
       if [ "$transformed" != "$content" ]; then
+        [ -w "$source" ] || die "template content path is not writable: $source_relative. No files were changed."
         content_paths[${#content_paths[@]}]="$source"
         content_values[${#content_values[@]}]="$transformed"
       fi
@@ -238,26 +274,33 @@ for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
       [ -d "$source" ] || die "template directory path is not a directory: $source_relative. No files were changed."
       [ "$source" != "$destination" ] || continue
       ! path_exists "$destination" || die "initialization target collision: $destination_relative already exists. No files were changed."
+      assert_changeable_parent "$destination" "$destination_relative" "initialization target"
       register_target "$destination"
       directory_sources[${#directory_sources[@]}]="$source"
       directory_targets[${#directory_targets[@]}]="$destination"
       ;;
     move|activate)
       path_exists "$source" || continue
-      { [ -f "$source" ] || [ -L "$source" ]; } || die "template move source is not a file: $source_relative. No files were changed."
+      [ -f "$source" ] || die "template move source is not a file: $source_relative. No files were changed."
       [ "$source" != "$destination" ] || continue
       ! path_exists "$destination" || die "initialization target collision: $destination_relative already exists. No files were changed."
       parent="$(dirname "$destination")"
       if path_exists "$parent" && [ ! -d "$parent" ]; then
         die "initialization target parent is not a directory: $destination_relative. No files were changed."
       fi
+      assert_changeable_parent "$destination" "$destination_relative" "initialization target"
+      assert_changeable_parent "$source" "$source_relative" "template move source"
       register_target "$destination"
       move_sources[${#move_sources[@]}]="$source"
       move_targets[${#move_targets[@]}]="$destination"
       ;;
     remove)
-      if path_exists "$source" && { [ ! -f "$source" ] && [ ! -L "$source" ]; }; then
+      if path_exists "$source" && [ ! -f "$source" ]; then
         die "template-only removal path is not a file: $source_relative. No files were changed."
+      fi
+      if path_exists "$source"; then
+        [ -w "$source" ] || die "template-only removal path is not writable: $source_relative. No files were changed."
+        assert_changeable_parent "$source" "$source_relative" "template-only removal"
       fi
       remove_paths[${#remove_paths[@]}]="$source"
       ;;
@@ -267,7 +310,82 @@ done
 echo "==> Initializing template as '$project_name'"
 echo "    Preflight validated ${#plan_kinds[@]} template-owned operation(s)."
 
+staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/csharp-template-init.XXXXXXXX")"
+declare -a backup_originals=()
+declare -a backup_copies=()
+declare -a completed_move_sources=()
+declare -a completed_move_targets=()
+declare -a created_directories=()
+declare -a removed_directories=()
+
+rollback_transaction() {
+  local exit_code=$?
+  local rollback_failed=0
+  local original backup existing
+  trap - ERR INT TERM
+  set +e
+
+  for existing in "${removed_directories[@]-}"; do
+    mkdir -p -- "$existing" || rollback_failed=1
+  done
+  for ((i = ${#completed_move_sources[@]} - 1; i >= 0; i--)); do
+    if path_exists "${completed_move_targets[$i]}" && ! path_exists "${completed_move_sources[$i]}"; then
+      mv -- "${completed_move_targets[$i]}" "${completed_move_sources[$i]}" || rollback_failed=1
+    fi
+  done
+  for ((i = 0; i < ${#backup_originals[@]}; i++)); do
+    original="${backup_originals[$i]}"
+    backup="${backup_copies[$i]}"
+    if [ -L "$original" ]; then
+      rm -f -- "$original" || rollback_failed=1
+    fi
+    cp -p -- "$backup" "$original" || rollback_failed=1
+  done
+  for ((i = ${#created_directories[@]} - 1; i >= 0; i--)); do
+    rmdir -- "${created_directories[$i]}" 2>/dev/null || true
+  done
+  rm -rf -- "$staging_dir" || rollback_failed=1
+
+  if [ "$rollback_failed" -ne 0 ]; then
+    echo "error: initialization failed and rollback was incomplete." >&2
+  else
+    echo "error: initialization failed; all changes were rolled back." >&2
+  fi
+  [ "$exit_code" -ne 0 ] || exit_code=1
+  exit "$exit_code"
+}
+
+trap rollback_transaction ERR INT TERM
+
+backup_file() {
+  local original="$1"
+  local existing
+  local backup
+  for existing in "${backup_originals[@]-}"; do
+    [ "$existing" != "$original" ] || return 0
+  done
+  backup="$staging_dir/${#backup_originals[@]}.bak"
+  cp -p -- "$original" "$backup"
+  backup_originals[${#backup_originals[@]}]="$original"
+  backup_copies[${#backup_copies[@]}]="$backup"
+}
+
+for path in "${content_paths[@]-}" "${remove_paths[@]-}"; do
+  if [ -n "$path" ] && [ -f "$path" ]; then
+    backup_file "$path"
+  fi
+done
+if [ "$keep_script" -ne 1 ]; then
+  for path in "$sibling_ps1" "$self"; do
+    if [ -f "$path" ]; then
+      backup_file "$path"
+    fi
+  done
+fi
+
 for ((i = 0; i < ${#content_paths[@]}; i++)); do
+  relative="${content_paths[$i]#"$repo_root/"}"
+  assert_no_link_components "$relative" "content source"
   printf '%s' "${content_values[$i]}" > "${content_paths[$i]}"
 done
 echo "    Updated contents in ${#content_paths[@]} file(s)."
@@ -275,24 +393,47 @@ echo "    Updated contents in ${#content_paths[@]} file(s)."
 # Destination directories are created empty; only listed files move into them.
 # Unknown files inside token-named source directories stay at their original paths.
 for ((i = 0; i < ${#directory_sources[@]}; i++)); do
+  assert_no_link_components "${directory_sources[$i]#"$repo_root/"}" "directory source"
+  assert_no_link_components "${directory_targets[$i]#"$repo_root/"}" "directory destination"
+  created_directories[${#created_directories[@]}]="${directory_targets[$i]}"
   mkdir -- "${directory_targets[$i]}"
 done
 for ((i = 0; i < ${#move_sources[@]}; i++)); do
+  assert_no_link_components "${move_sources[$i]#"$repo_root/"}" "move source"
+  assert_no_link_components "${move_targets[$i]#"$repo_root/"}" "move destination"
+  completed_move_sources[${#completed_move_sources[@]}]="${move_sources[$i]}"
+  completed_move_targets[${#completed_move_targets[@]}]="${move_targets[$i]}"
   mv -- "${move_sources[$i]}" "${move_targets[$i]}"
   echo "    Moved ${move_sources[$i]#"$repo_root/"} -> ${move_targets[$i]#"$repo_root/"}"
 done
 for path in "${remove_paths[@]}"; do
-  if [ -f "$path" ] || [ -L "$path" ]; then
+  if [ -f "$path" ]; then
+    assert_no_link_components "${path#"$repo_root/"}" "removal source"
     rm -f -- "$path"
     echo "    Removed ${path#"$repo_root/"}"
   fi
 done
 
 for ((i = ${#directory_sources[@]} - 1; i >= 0; i--)); do
-  rmdir -- "${directory_sources[$i]}" 2>/dev/null || true
+  assert_no_link_components "${directory_sources[$i]#"$repo_root/"}" "directory cleanup source"
+  if rmdir -- "${directory_sources[$i]}" 2>/dev/null; then
+    removed_directories[${#removed_directories[@]}]="${directory_sources[$i]}"
+  fi
 done
-rmdir -- "$repo_root/docs" 2>/dev/null || true
-rmdir -- "$repo_root/scripts/tests" 2>/dev/null || true
+for path in "$repo_root/docs" "$repo_root/scripts/tests"; do
+  assert_no_link_components "${path#"$repo_root/"}" "directory cleanup source"
+  if rmdir -- "$path" 2>/dev/null; then
+    removed_directories[${#removed_directories[@]}]="$path"
+  fi
+done
+
+if [ "$keep_script" -ne 1 ]; then
+  rm -f -- "$sibling_ps1"
+  rm -f -- "$self"
+fi
+
+trap - ERR INT TERM
+rm -rf -- "$staging_dir"
 
 echo ""
 echo "Done. Next steps:"
@@ -302,9 +443,3 @@ echo "  3. Review LICENSE (author/year) and the .csproj package metadata."
 echo "  4. NuGet publishing: add the NUGET_API_KEY repo secret, or delete"
 echo "     .github/workflows/release.yml and the packaging properties in the .csproj."
 echo "  5. Commit the initialized project."
-
-# 5) Remove both initializers unless asked to keep them.
-if [ "$keep_script" -ne 1 ]; then
-  rm -f "$sibling_ps1"
-  rm -f "$self"
-fi

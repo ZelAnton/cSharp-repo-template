@@ -56,7 +56,11 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
      binary data, `.work`, caches, and unknown files inside the original
      token-named source directories remain byte-for-byte at their original paths;
    - stops before the first mutation if any planned destination already exists,
-     including a generated solution/project path or `.claude/settings.json`;
+     including a generated solution/project path or `.claude/settings.json`, and
+     rejects symlink, junction, or other reparse-point components in every
+     planned source and destination;
+   - restores the complete original tree if an I/O failure still occurs after
+     preflight while content, paths, or template-only files are being changed;
    - replaces all placeholder tokens in one pass, so placeholder-like text inside
      a supplied value stays literal and does not trigger another replacement;
    - preserves quotes, backslashes, and shell/Python metacharacters as data,

@@ -61,7 +61,8 @@ function Invoke-WithEnvironment(
     [string]$filePath,
     [string[]]$arguments,
     [string]$workingDirectory,
-    [hashtable]$environment
+    [hashtable]$environment,
+    [switch]$ExpectFailure
 ) {
     $previous = @{}
     foreach ($name in $environment.Keys) {
@@ -70,7 +71,7 @@ function Invoke-WithEnvironment(
     }
 
     try {
-        return Invoke-Native $filePath $arguments $workingDirectory
+        return Invoke-Native $filePath $arguments $workingDirectory -ExpectFailure:$ExpectFailure
     }
     finally {
         foreach ($name in $environment.Keys) {
@@ -87,7 +88,8 @@ function Invoke-BashInitializer(
     [string]$githubOwner,
     [string]$description,
     [string]$year,
-    [switch]$ExpectFailure
+    [switch]$ExpectFailure,
+    [string]$PathPrefix
 ) {
     $encodedValues = @(
         $projectName,
@@ -98,9 +100,10 @@ function Invoke-BashInitializer(
         $year
     ) | ForEach-Object { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_)) }
     $runnerFile = Join-Path $workingDirectory '.init-test-runner.sh'
+    $pathSetup = if ($PathPrefix) { "export PATH='$PathPrefix':`$PATH`n" } else { '' }
     $command = @"
 #!/usr/bin/env bash
-exec ./scripts/init.sh \
+$pathSetup`nexec ./scripts/init.sh \
   --project-name "`$(printf '%s' '$($encodedValues[0])' | base64 --decode)" \
   --author "`$(printf '%s' '$($encodedValues[1])' | base64 --decode)" \
   --author-email "`$(printf '%s' '$($encodedValues[2])' | base64 --decode)" \
@@ -159,14 +162,19 @@ function Assert-TreesEqual([string]$left, [string]$right) {
 
 function Get-TreeSnapshot([string]$root) {
     $entries = @()
-    foreach ($directory in Get-ChildItem -LiteralPath $root -Directory -Force -Recurse) {
-        $relative = [IO.Path]::GetRelativePath($root, $directory.FullName).Replace('\', '/')
-        $entries += "D:$relative"
-    }
-    foreach ($file in Get-ChildItem -LiteralPath $root -File -Force -Recurse) {
-        $relative = [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
-        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
-        $entries += "F:$relative`:$hash"
+    foreach ($item in Get-ChildItem -LiteralPath $root -Force -Recurse) {
+        $relative = [IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            $target = @($item.Target) -join '|'
+            $entries += "L:$relative`:$($item.LinkType):$target`:$([int64]$item.Attributes)"
+        }
+        elseif ($item.PSIsContainer) {
+            $entries += "D:$relative`:$([int64]$item.Attributes)"
+        }
+        else {
+            $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+            $entries += "F:$relative`:$hash`:$([int64]$item.Attributes)"
+        }
     }
     return @($entries | Sort-Object)
 }
@@ -242,6 +250,131 @@ function Test-PreflightCollision([string]$initializer, [string]$collision) {
     Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the tree after the $collision preflight failure."
     Assert-True (Test-Path -LiteralPath (Join-Path $root 'src/__ProjectName__/__ProjectName__.csproj')) "$initializer partially renamed the project after the $collision preflight failure."
     Assert-True (Test-Path -LiteralPath (Join-Path $root '.claude/settings.json.template')) "$initializer partially activated settings after the $collision preflight failure."
+}
+
+function Invoke-InitializerExpectingFailure([string]$initializer, [string]$root, [string]$projectName) {
+    if ($initializer -eq 'pwsh') {
+        return Invoke-Native 'pwsh' @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $projectName,
+            '-Author', 'Safety Author',
+            '-AuthorEmail', 'safety@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Path safety regression',
+            '-Year', '2042',
+            '-KeepScript'
+        ) $root -ExpectFailure
+    }
+
+    return Invoke-BashInitializer $root $projectName 'Safety Author' 'safety@example.invalid' 'safe-owner' 'Path safety regression' '2042' -ExpectFailure
+}
+
+function Test-LinkSafety([string]$initializer, [string]$linkKind) {
+    $projectName = 'Acme.LinkSafety'
+    $root = Join-Path $tempRoot "link-$initializer-$linkKind"
+    Copy-Template $root
+
+    if ($linkKind -eq 'file') {
+        $externalRoot = Join-Path $tempRoot "external-file-$initializer"
+        if ($IsWindows) {
+            Move-Item -LiteralPath (Join-Path $root 'docs') -Destination $externalRoot
+            New-Item -ItemType Junction -Path (Join-Path $root 'docs') -Target $externalRoot | Out-Null
+        }
+        else {
+            [IO.Directory]::CreateDirectory($externalRoot) | Out-Null
+            $externalPath = Join-Path $externalRoot 'README.md'
+            [IO.File]::WriteAllText($externalPath, "external __ProjectName__`n", $utf8NoBom)
+            Remove-Item -LiteralPath (Join-Path $root 'README.md') -Force
+            New-Item -ItemType SymbolicLink -Path (Join-Path $root 'README.md') -Target $externalPath | Out-Null
+        }
+    }
+    else {
+        $externalRoot = Join-Path $tempRoot "external-directory-$initializer"
+        Move-Item -LiteralPath (Join-Path $root 'src') -Destination $externalRoot
+        $itemType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        New-Item -ItemType $itemType -Path (Join-Path $root 'src') -Target $externalRoot | Out-Null
+    }
+
+    $before = Get-TreeSnapshot $root
+    $externalBefore = Get-TreeSnapshot $externalRoot
+    $result = Invoke-InitializerExpectingFailure $initializer $root $projectName
+    $after = Get-TreeSnapshot $root
+    $externalAfter = Get-TreeSnapshot $externalRoot
+
+    Assert-True ($result.Output -match '(?i)(symbolic link|reparse point)') "$initializer did not report the unsafe $linkKind link clearly."
+    Assert-True ($result.Output -match 'No files were changed') "$initializer did not report the link rejection as non-mutating."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the repository after rejecting the $linkKind link."
+    Assert-True (@(Compare-Object $externalBefore $externalAfter).Count -eq 0) "$initializer changed the external $linkKind target."
+}
+
+function Test-LateFailureRollback([string]$initializer) {
+    $projectName = 'Acme.Rollback'
+    $root = Join-Path $tempRoot "rollback-$initializer"
+    Copy-Template $root
+
+    if ($initializer -eq 'pwsh') {
+        $wrapper = Join-Path $tempRoot 'late-failure-wrapper.ps1'
+        $wrapperText = @'
+param([string]$Root)
+$ErrorActionPreference = 'Stop'
+$script:moveCount = 0
+function Move-Item {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath,
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+    $script:moveCount++
+    if ($script:moveCount -eq 2) {
+        throw 'Injected late move I/O failure.'
+    }
+    Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination
+}
+Set-Location $Root
+& ./scripts/init.ps1 `
+    -ProjectName Acme.Rollback `
+    -Author 'Rollback Author' `
+    -AuthorEmail rollback@example.invalid `
+    -GitHubOwner safe-owner `
+    -Description 'Rollback regression' `
+    -Year 2042 `
+    -KeepScript
+'@
+        [IO.File]::WriteAllText($wrapper, $wrapperText.Replace("`r`n", "`n"), $utf8NoBom)
+        $before = Get-TreeSnapshot $root
+        $result = Invoke-Native 'pwsh' @('-NoProfile', '-File', $wrapper, '-Root', $root) $root -ExpectFailure
+    }
+    else {
+        $shimDirectory = Join-Path $root '.test-shim'
+        [IO.Directory]::CreateDirectory($shimDirectory) | Out-Null
+        $stateName = "csharp-init-mv-$([Guid]::NewGuid().ToString('N'))"
+        $realMove = (Invoke-Native 'bash' @('-c', 'command -v mv') $root).Output.Trim()
+        $shim = @"
+#!/usr/bin/env bash
+state='/tmp/$stateName'
+count=0
+[ ! -f "`$state" ] || count="`$(cat "`$state")"
+count=`$((count + 1))
+printf '%s' "`$count" > "`$state"
+if [ "`$count" -eq 2 ]; then
+  echo 'injected late move I/O failure' >&2
+  exit 73
+fi
+exec '$realMove' "`$@"
+"@
+        [IO.File]::WriteAllText((Join-Path $shimDirectory 'mv'), $shim.Replace("`r`n", "`n"), $utf8NoBom)
+        $null = Invoke-Native 'bash' @('-c', 'chmod +x ./.test-shim/mv') $root
+        $before = Get-TreeSnapshot $root
+        $result = Invoke-BashInitializer $root $projectName 'Rollback Author' 'rollback@example.invalid' 'safe-owner' 'Rollback regression' '2042' -ExpectFailure -PathPrefix './.test-shim'
+        $null = Invoke-Native 'bash' @('-c', "rm -f '/tmp/$stateName'") $root
+    }
+
+    $after = Get-TreeSnapshot $root
+    Assert-True ($result.Output -match '(?i)(rolled back|rollback)') "$initializer did not report rollback after the late failure."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer did not restore the complete tree after the late failure."
 }
 
 function Get-WorkflowIdentityEnvironment([string]$root) {
@@ -649,6 +782,12 @@ try {
     Test-PreflightCollision 'bash' 'rename'
     Test-PreflightCollision 'pwsh' 'settings'
     Test-PreflightCollision 'bash' 'settings'
+    Test-LinkSafety 'pwsh' 'file'
+    Test-LinkSafety 'bash' 'file'
+    Test-LinkSafety 'pwsh' 'directory'
+    Test-LinkSafety 'bash' 'directory'
+    Test-LateFailureRollback 'pwsh'
+    Test-LateFailureRollback 'bash'
 
     if (-not $SkipBuild) {
         $cleanProjectName = 'Acme.CleanInit'
@@ -675,7 +814,7 @@ try {
         Test-BuildAndTests $cleanBashRoot $cleanProjectName
     }
 
-    Write-Host 'PASS: PowerShell and Bash initialization are scoped, collision-safe, non-cascading, equivalent, syntax-valid, and injection-safe.' -ForegroundColor Green
+    Write-Host 'PASS: PowerShell and Bash initialization are scoped, link-safe, transactional, collision-safe, non-cascading, equivalent, syntax-valid, and injection-safe.' -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

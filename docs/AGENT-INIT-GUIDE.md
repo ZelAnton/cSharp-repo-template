@@ -83,7 +83,11 @@ assumptions a past agent got wrong:
    replacement is one pass, XML destinations are escaped, and the workflow
    identity is serialized before Bash receives it. Before any mutation, the
    initializer loads and validates the complete `scripts/init-plan.tsv` plan and
-   rejects every existing destination, including `.claude/settings.json`.
+   rejects every existing destination, including `.claude/settings.json`. It
+   also rejects symlink, junction, and other reparse-point components in planned
+   sources, destinations, and their existing ancestors. If an I/O error still
+   occurs after preflight, the mutation journal restores the complete original
+   tree before the initializer reports failure.
    `content` entries are the exact substitution boundary; no recursive scan is
    performed. Only the listed solution, Rider settings, sample source/test, and
    project files move to generated paths. Unknown text or binary files, `.work`,
@@ -272,8 +276,9 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
 - **Root cause:** Both initializers recursively enumerated the checkout and used a
   forced settings move without a complete collision preflight.
 - **Rule:** Mutate only entries in `scripts/init-plan.tsv`, validate every planned
-  destination before the first write, and keep the cross-shell preservation and
-  collision cases in `scripts/tests/init-substitution.tests.ps1` green.
+  source, destination, and existing ancestor before the first write, roll back
+  unexpected late failures, and keep the cross-shell preservation, link-safety,
+  collision, and rollback cases in `scripts/tests/init-substitution.tests.ps1` green.
 
 ### 2026-08-21 — Metadata could cascade or enter the release shell as code
 - **Symptom:** Quotes, shell metacharacters, line breaks, or another placeholder
