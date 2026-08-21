@@ -120,6 +120,135 @@ function Invoke-PythonBlock(
     return $output
 }
 
+function Test-ExplicitSymbolPush([IO.FileInfo]$symbolPackage, [string]$caseRoot) {
+    $serverPath = Join-Path $caseRoot 'symbol-server.py'
+    $portPath = Join-Path $caseRoot 'symbol-server-port.txt'
+    $uploadPath = Join-Path $caseRoot 'published.snupkg'
+    $serverScript = @'
+import http.server
+import json
+import os
+from email.parser import BytesParser
+from email.policy import default
+from pathlib import Path
+
+port_path = Path(os.environ["PORT_PATH"])
+upload_path = Path(os.environ["UPLOAD_PATH"])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def send_body(self, status, body=b"", content_type="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path != "/v3/index.json":
+            self.send_body(404)
+            return
+        root = f"http://127.0.0.1:{self.server.server_port}"
+        body = json.dumps({
+            "version": "3.0.0",
+            "resources": [
+                {"@id": f"{root}/package", "@type": "PackagePublish/2.0.0"},
+                {"@id": f"{root}/symbol", "@type": "SymbolPackagePublish/4.9.0"},
+            ],
+        }).encode("utf-8")
+        self.send_body(200, body)
+
+    def do_PUT(self):
+        if self.path.rstrip("/") != "/symbol":
+            self.send_body(404)
+            return
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            chunks = []
+            while True:
+                size_line = self.rfile.readline().strip()
+                size = int(size_line.split(b";", 1)[0], 16)
+                if size == 0:
+                    self.rfile.readline()
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            body = b"".join(chunks)
+        else:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.lower().startswith("multipart/"):
+            message = BytesParser(policy=default).parsebytes(
+                f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii") + body
+            )
+            parts = list(message.iter_parts())
+            if len(parts) != 1:
+                self.send_body(400)
+                return
+            body = parts[0].get_payload(decode=True)
+        upload_path.write_bytes(body)
+        self.send_body(201, b"")
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+port_path.write_text(str(server.server_port), encoding="utf-8")
+server.serve_forever()
+'@
+    [IO.File]::WriteAllText($serverPath, $serverScript, $utf8NoBom)
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $python.Source
+    $startInfo.WorkingDirectory = $caseRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.Environment['PORT_PATH'] = $portPath
+    $startInfo.Environment['UPLOAD_PATH'] = $uploadPath
+    [void]$startInfo.ArgumentList.Add($serverPath)
+
+    $server = [Diagnostics.Process]::new()
+    $server.StartInfo = $startInfo
+    [void]$server.Start()
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path -LiteralPath $portPath -PathType Leaf)) {
+            if ($server.HasExited) {
+                throw "The local NuGet server exited before startup: $($server.StandardError.ReadToEnd())"
+            }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw 'The local NuGet server did not become ready within 10 seconds.'
+            }
+            Start-Sleep -Milliseconds 50
+        }
+
+        $serviceIndex = "http://127.0.0.1:$([IO.File]::ReadAllText($portPath))/v3/index.json"
+        [void](Invoke-Dotnet $caseRoot @(
+            'nuget', 'push', $symbolPackage.FullName,
+            '--source', $serviceIndex,
+            '--api-key', 'local-test-key',
+            '--symbol-source', $serviceIndex,
+            '--symbol-api-key', 'local-test-key',
+            '--skip-duplicate',
+            '--allow-insecure-connections',
+            '--force-english-output'
+        ))
+
+        Assert-True (Test-Path -LiteralPath $uploadPath -PathType Leaf) 'The real NuGet CLI returned without sending the explicit .snupkg to the symbol endpoint.'
+        Assert-BytesEqual ([IO.File]::ReadAllBytes($symbolPackage.FullName)) ([IO.File]::ReadAllBytes($uploadPath)) 'The explicit symbol publication did not preserve the packed .snupkg.'
+    }
+    finally {
+        if (-not $server.HasExited) {
+            $server.Kill($true)
+            $server.WaitForExit()
+        }
+        $server.Dispose()
+    }
+}
+
 function Read-GitHubOutputs([string]$path) {
     $outputs = @{}
     foreach ($line in [IO.File]::ReadAllLines($path)) {
@@ -233,6 +362,10 @@ function Test-PackedReleaseState([pscustomobject]$releaseCase, [string]$version,
         Where-Object { -not $_.Name.EndsWith('.snupkg', [StringComparison]::OrdinalIgnoreCase) })
     Assert-Equal 1 $packages.Count 'The pack regression must produce exactly one .nupkg.'
 
+    $symbolPackages = @(Get-ChildItem -LiteralPath $artifactRoot -Filter '*.snupkg' -File)
+    Assert-Equal 1 $symbolPackages.Count 'The pack regression must produce exactly one .snupkg.'
+    Test-ExplicitSymbolPush $symbolPackages[0] $caseRoot
+
     $archive = [IO.Compression.ZipFile]::OpenRead($packages[0].FullName)
     try {
         $changelogEntry = $archive.Entries | Where-Object { $_.FullName -ceq 'CHANGELOG.md' }
@@ -332,7 +465,14 @@ try {
     Assert-True $publishScript.Contains('timeout=300') 'The NuGet client attempt is no longer bounded before the job-level timeout.'
     Assert-True $publishScript.Contains('"./artifacts/*.nupkg"') 'The NuGet pivot no longer publishes the main package explicitly.'
     Assert-True $publishScript.Contains('"./artifacts/*.snupkg"') 'The NuGet pivot no longer publishes the symbol package explicitly.'
-    Assert-True $publishScript.Contains('"--no-symbols"') 'The main-package acceptance decision is no longer isolated from symbol publication.'
+    $packageCommandMatch = [regex]::Match($publishScript, '(?ms)^package_command = \[(?<command>.*?)^\]$')
+    $symbolCommandMatch = [regex]::Match($publishScript, '(?ms)^symbol_command = \[(?<command>.*?)^\]$')
+    Assert-True $packageCommandMatch.Success 'The main-package command could not be inspected.'
+    Assert-True $symbolCommandMatch.Success 'The symbol-package command could not be inspected.'
+    Assert-True $packageCommandMatch.Groups['command'].Value.Contains('"--no-symbols"') 'The main-package acceptance decision is no longer isolated from automatic symbol publication.'
+    Assert-False $symbolCommandMatch.Groups['command'].Value.Contains('"--no-symbols"') 'The explicit .snupkg command must not disable its own symbol source.'
+    Assert-True $symbolCommandMatch.Groups['command'].Value.Contains('"--symbol-source"') 'The explicit .snupkg command must provide a symbol source to the NuGet client.'
+    Assert-True $symbolCommandMatch.Groups['command'].Value.Contains('"--symbol-api-key"') 'The explicit .snupkg command must authenticate against its symbol source.'
     Assert-True $recoveryStep.Contains('always() && (failure() || cancelled()) &&') 'The recovery upload no longer covers both failed and cancelled NuGet client steps.'
     Assert-True $recoveryStep.Contains('steps.nuget_publish.outputs.recovery_required == ''true''') 'The recovery upload is not guarded by the publish attempt state.'
     Assert-True $recoveryStep.Contains('hashFiles(''artifacts/.nuget-recovery-required'') != ''''') 'The recovery upload no longer has a cancellation-safe local marker guard.'

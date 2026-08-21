@@ -571,8 +571,9 @@ jobs:
               "dotnet", "nuget", "push", "./artifacts/*.snupkg",
               "--source", "https://api.nuget.org/v3/index.json",
               "--api-key", os.environ["NUGET_API_KEY"],
+              "--symbol-source", "https://api.nuget.org/v3/index.json",
+              "--symbol-api-key", os.environ["NUGET_API_KEY"],
               "--skip-duplicate",
-              "--no-symbols",
               "--force-english-output",
           ]
           for attempt in range(1, 4):
