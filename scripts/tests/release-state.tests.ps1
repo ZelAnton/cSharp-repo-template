@@ -120,6 +120,28 @@ function Invoke-PythonBlock(
     return $output
 }
 
+function Read-GitHubOutputs([string]$path) {
+    $outputs = @{}
+    foreach ($line in [IO.File]::ReadAllLines($path)) {
+        $parts = $line.Split('=', 2)
+        $outputs[$parts[0]] = $parts[1]
+    }
+    return $outputs
+}
+
+function Assert-RecoveryGuard(
+    [string]$jobOutcome,
+    [hashtable]$publishOutputs,
+    [string]$markerPath,
+    [bool]$expected,
+    [string]$message
+) {
+    $terminalFailure = $jobOutcome -in @('failure', 'cancelled')
+    $recoveryRequired = $publishOutputs['recovery_required'] -ceq 'true' -or `
+        (Test-Path -LiteralPath $markerPath -PathType Leaf)
+    Assert-Equal $expected ($terminalFailure -and $recoveryRequired) $message
+}
+
 function Invoke-ReleaseStateCase(
     [string]$name,
     [string]$version,
@@ -263,6 +285,8 @@ try {
     $extractScript = Get-WorkflowPython $workflow 'Extract release notes from release section'
     $publishScript = Get-WorkflowPython $workflow 'Push to NuGet.org (irreversible pivot)'
     $publishStep = Get-WorkflowStepBlock $workflow 'Push to NuGet.org (irreversible pivot)'
+    $pushStep = Get-WorkflowStepBlock $workflow 'Push the release commit + tag (atomic)'
+    $releaseStep = Get-WorkflowStepBlock $workflow 'Create or update the GitHub Release (idempotent)'
     $recoveryStep = Get-WorkflowStepBlock $workflow 'Preserve exact post-pivot recovery state'
 
     $steps = [ordered]@{
@@ -300,8 +324,16 @@ try {
     Assert-True $publishScript.Contains('write_output("acceptance", "not-attempted")') 'The NuGet pivot no longer distinguishes a skipped attempt from an ambiguous response.'
     Assert-True $publishScript.Contains('write_output("acceptance", "ambiguous")') 'The NuGet pivot no longer fails safe before its first network attempt.'
     Assert-True $publishScript.Contains('write_output("acceptance", "accepted")') 'The NuGet pivot no longer records confirmed client success.'
-    Assert-True $recoveryStep.Contains('always() && failure() &&') 'The recovery upload no longer runs after a failed NuGet client step.'
+    Assert-True $publishScript.Contains('write_output("acceptance", "rejected")') 'The NuGet pivot no longer records a confirmed terminal rejection.'
+    Assert-True $publishScript.Contains('timeout=300') 'The NuGet client attempt is no longer bounded before the job-level timeout.'
+    Assert-True $publishScript.Contains('"./artifacts/*.nupkg"') 'The NuGet pivot no longer publishes the main package explicitly.'
+    Assert-True $publishScript.Contains('"./artifacts/*.snupkg"') 'The NuGet pivot no longer publishes the symbol package explicitly.'
+    Assert-True $publishScript.Contains('"--no-symbols"') 'The main-package acceptance decision is no longer isolated from symbol publication.'
+    Assert-True $recoveryStep.Contains('always() && (failure() || cancelled()) &&') 'The recovery upload no longer covers both failed and cancelled NuGet client steps.'
     Assert-True $recoveryStep.Contains('steps.nuget_publish.outputs.recovery_required == ''true''') 'The recovery upload is not guarded by the publish attempt state.'
+    Assert-True $recoveryStep.Contains('hashFiles(''artifacts/.nuget-recovery-required'') != ''''') 'The recovery upload no longer has a cancellation-safe local marker guard.'
+    Assert-False ([regex]::IsMatch($pushStep, '(?m)^        if:')) 'The VCS push must retain the default success guard after the NuGet pivot.'
+    Assert-False ([regex]::IsMatch($releaseStep, '(?m)^        if:')) 'The GitHub Release must retain the default success guard after the NuGet pivot.'
     Assert-True $recoveryStep.Contains('artifacts/release-recovery.bundle') 'The recovery artifact no longer contains the local release commit and tag.'
     Assert-True $recoveryStep.Contains('artifacts/*.nupkg') 'The recovery artifact no longer contains the exact published package.'
     Assert-True $recoveryStep.Contains('artifacts/*.snupkg') 'The recovery artifact no longer contains the exact symbol package.'
@@ -317,19 +349,110 @@ try {
     }
     Assert-True $workflow.Contains('Once NuGet accepts the package,') 'The workflow header must prohibit rebuilding as soon as the package is accepted.'
 
-    $ambiguousCase = Join-Path $tempRoot 'ambiguous-publish'
-    [IO.Directory]::CreateDirectory($ambiguousCase) | Out-Null
-    $publishOutputPath = Join-Path $ambiguousCase 'github-output.txt'
-    $acceptedMarkerPath = Join-Path $ambiguousCase 'server-accepted.txt'
-    $publishPrelude = @'
+    $rejectedCase = Join-Path $tempRoot 'confirmed-rejection'
+    [IO.Directory]::CreateDirectory((Join-Path $rejectedCase 'artifacts')) | Out-Null
+    $rejectedOutputPath = Join-Path $rejectedCase 'github-output.txt'
+    $rejectedAttemptPath = Join-Path $rejectedCase 'attempted.txt'
+    $rejectedRecoveryMarker = Join-Path $rejectedCase 'artifacts/.nuget-recovery-required'
+    $rejectedPrelude = @'
 import os
 import subprocess
 import time
 
-def accepted_but_client_failed(command, check=False):
+def confirmed_rejection(command, **kwargs):
+    with open(os.environ["ATTEMPT_MARKER"], "a", encoding="utf-8") as marker:
+        marker.write("attempted\n")
+    return subprocess.CompletedProcess(
+        command,
+        1,
+        stdout="",
+        stderr="error: Response status code does not indicate success: 403 (Forbidden).\n",
+    )
+
+subprocess.run = confirmed_rejection
+time.sleep = lambda seconds: None
+'@
+    $rejectedFailure = Invoke-PythonBlock `
+        -WorkingDirectory $rejectedCase `
+        -ScriptName 'publish-rejected.py' `
+        -Script $publishScript `
+        -Prelude "$rejectedPrelude`n" `
+        -Environment @{
+            ATTEMPT_MARKER = $rejectedAttemptPath
+            GITHUB_OUTPUT = $rejectedOutputPath
+            NUGET_API_KEY = 'test-key-not-a-secret'
+        } `
+        -ExpectFailure
+    $rejectedOutputs = Read-GitHubOutputs $rejectedOutputPath
+    Assert-Equal 'rejected' $rejectedOutputs['acceptance'] 'A structured terminal rejection was not classified as rejected.'
+    Assert-Equal 'false' $rejectedOutputs['recovery_required'] 'A confirmed rejection incorrectly requested a remote recovery artifact.'
+    Assert-Equal 1 ([IO.File]::ReadAllLines($rejectedAttemptPath).Length) 'A confirmed rejection should not be retried.'
+    Assert-False (Test-Path -LiteralPath $rejectedRecoveryMarker) 'A confirmed rejection left the recovery marker behind.'
+    Assert-RecoveryGuard 'failure' $rejectedOutputs $rejectedRecoveryMarker $false 'A confirmed rejection would create a remote recovery trace.'
+    Assert-True $rejectedFailure.Contains('NuGet conclusively rejected the package') 'Confirmed rejection omitted the no-trace operator diagnostic.'
+    Write-Host 'PASS confirmed-rejection-leaves-no-recovery-trace'
+
+    $partialCase = Join-Path $tempRoot 'package-accepted-symbol-rejected'
+    [IO.Directory]::CreateDirectory((Join-Path $partialCase 'artifacts')) | Out-Null
+    $partialOutputPath = Join-Path $partialCase 'github-output.txt'
+    $partialAttemptPath = Join-Path $partialCase 'attempted.txt'
+    $partialRecoveryMarker = Join-Path $partialCase 'artifacts/.nuget-recovery-required'
+    $partialPrelude = @'
+import os
+import subprocess
+import time
+
+def package_accepted_symbol_rejected(command, **kwargs):
+    target = command[3]
+    with open(os.environ["ATTEMPT_MARKER"], "a", encoding="utf-8") as marker:
+        marker.write(f"{target}\n")
+    if target == "./artifacts/*.nupkg":
+        return subprocess.CompletedProcess(command, 0, stdout="package accepted\n", stderr="")
+    return subprocess.CompletedProcess(
+        command,
+        1,
+        stdout="",
+        stderr="error: Response status code does not indicate success: 403 (Forbidden).\n",
+    )
+
+subprocess.run = package_accepted_symbol_rejected
+time.sleep = lambda seconds: None
+'@
+    $partialFailure = Invoke-PythonBlock `
+        -WorkingDirectory $partialCase `
+        -ScriptName 'publish-partial.py' `
+        -Script $publishScript `
+        -Prelude "$partialPrelude`n" `
+        -Environment @{
+            ATTEMPT_MARKER = $partialAttemptPath
+            GITHUB_OUTPUT = $partialOutputPath
+            NUGET_API_KEY = 'test-key-not-a-secret'
+        } `
+        -ExpectFailure
+    $partialOutputs = Read-GitHubOutputs $partialOutputPath
+    $partialAttempts = [IO.File]::ReadAllLines($partialAttemptPath)
+    Assert-Equal 'accepted' $partialOutputs['acceptance'] 'A symbol rejection incorrectly erased confirmed main-package acceptance.'
+    Assert-Equal 'true' $partialOutputs['recovery_required'] 'A post-pivot symbol rejection did not preserve exact recovery state.'
+    Assert-Equal 1 @($partialAttempts | Where-Object { $_ -ceq './artifacts/*.nupkg' }).Count 'The main package was not accepted exactly once.'
+    Assert-Equal 3 @($partialAttempts | Where-Object { $_ -ceq './artifacts/*.snupkg' }).Count 'The symbol package did not execute all retry attempts.'
+    Assert-RecoveryGuard 'failure' $partialOutputs $partialRecoveryMarker $true 'A post-pivot symbol rejection would not upload exact recovery state.'
+    Assert-True $partialFailure.Contains('package is ALREADY on nuget.org') 'Post-pivot symbol rejection omitted the immutable-package diagnostic.'
+    Write-Host 'PASS symbol-rejection-remains-post-pivot'
+
+    $ambiguousCase = Join-Path $tempRoot 'ambiguous-publish'
+    [IO.Directory]::CreateDirectory((Join-Path $ambiguousCase 'artifacts')) | Out-Null
+    $ambiguousOutputPath = Join-Path $ambiguousCase 'github-output.txt'
+    $acceptedMarkerPath = Join-Path $ambiguousCase 'server-accepted.txt'
+    $ambiguousRecoveryMarker = Join-Path $ambiguousCase 'artifacts/.nuget-recovery-required'
+    $ambiguousPrelude = @'
+import os
+import subprocess
+import time
+
+def accepted_but_client_failed(command, **kwargs):
     with open(os.environ["ACCEPTED_MARKER"], "a", encoding="utf-8") as marker:
         marker.write("accepted\n")
-    return subprocess.CompletedProcess(command, 1)
+    return subprocess.CompletedProcess(command, 1, stdout="", stderr="connection reset\n")
 
 subprocess.run = accepted_but_client_failed
 time.sleep = lambda seconds: None
@@ -338,23 +461,91 @@ time.sleep = lambda seconds: None
         -WorkingDirectory $ambiguousCase `
         -ScriptName 'publish-ambiguous.py' `
         -Script $publishScript `
-        -Prelude "$publishPrelude`n" `
+        -Prelude "$ambiguousPrelude`n" `
         -Environment @{
             ACCEPTED_MARKER = $acceptedMarkerPath
-            GITHUB_OUTPUT = $publishOutputPath
+            GITHUB_OUTPUT = $ambiguousOutputPath
             NUGET_API_KEY = 'test-key-not-a-secret'
         } `
         -ExpectFailure
-    $publishOutputs = @{}
-    foreach ($line in [IO.File]::ReadAllLines($publishOutputPath)) {
-        $parts = $line.Split('=', 2)
-        $publishOutputs[$parts[0]] = $parts[1]
-    }
-    Assert-Equal 'ambiguous' $publishOutputs['acceptance'] 'A terminal client failure after server acceptance was not classified as ambiguous.'
-    Assert-Equal 'true' $publishOutputs['recovery_required'] 'An ambiguous accepted publish did not require preservation of the exact recovery state.'
+    $ambiguousOutputs = Read-GitHubOutputs $ambiguousOutputPath
+    Assert-Equal 'ambiguous' $ambiguousOutputs['acceptance'] 'A terminal client failure after server acceptance was not classified as ambiguous.'
+    Assert-Equal 'true' $ambiguousOutputs['recovery_required'] 'An ambiguous accepted publish did not require preservation of the exact recovery state.'
     Assert-Equal 3 ([IO.File]::ReadAllLines($acceptedMarkerPath).Length) 'The ambiguous publish regression did not execute all retry attempts.'
+    Assert-True (Test-Path -LiteralPath $ambiguousRecoveryMarker -PathType Leaf) 'An ambiguous publish did not preserve the cancellation-safe recovery marker.'
+    Assert-RecoveryGuard 'failure' $ambiguousOutputs $ambiguousRecoveryMarker $true 'An ambiguous accepted publish would not upload exact recovery state.'
     Assert-True $ambiguousFailure.Contains('NuGet acceptance is ambiguous') 'The ambiguous publish failure omitted the fail-safe operator diagnostic.'
     Write-Host 'PASS ambiguous-publish-preserves-recovery'
+
+    $timeoutCase = Join-Path $tempRoot 'timed-out-publish'
+    [IO.Directory]::CreateDirectory((Join-Path $timeoutCase 'artifacts')) | Out-Null
+    $timeoutOutputPath = Join-Path $timeoutCase 'github-output.txt'
+    $timeoutAttemptPath = Join-Path $timeoutCase 'attempted.txt'
+    $timeoutRecoveryMarker = Join-Path $timeoutCase 'artifacts/.nuget-recovery-required'
+    $timeoutPrelude = @'
+import os
+import subprocess
+import time
+
+def timed_out_after_attempt(command, **kwargs):
+    with open(os.environ["ATTEMPT_MARKER"], "a", encoding="utf-8") as marker:
+        marker.write("attempted\n")
+    raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+subprocess.run = timed_out_after_attempt
+time.sleep = lambda seconds: None
+'@
+    $timeoutFailure = Invoke-PythonBlock `
+        -WorkingDirectory $timeoutCase `
+        -ScriptName 'publish-timeout.py' `
+        -Script $publishScript `
+        -Prelude "$timeoutPrelude`n" `
+        -Environment @{
+            ATTEMPT_MARKER = $timeoutAttemptPath
+            GITHUB_OUTPUT = $timeoutOutputPath
+            NUGET_API_KEY = 'test-key-not-a-secret'
+        } `
+        -ExpectFailure
+    $timeoutOutputs = Read-GitHubOutputs $timeoutOutputPath
+    Assert-Equal 'ambiguous' $timeoutOutputs['acceptance'] 'A timed-out publish was not classified as ambiguous.'
+    Assert-Equal 3 ([IO.File]::ReadAllLines($timeoutAttemptPath).Length) 'The timed-out publish regression did not execute all bounded attempts.'
+    Assert-RecoveryGuard 'failure' $timeoutOutputs $timeoutRecoveryMarker $true 'A timed-out publish would not upload exact recovery state.'
+    Assert-True $timeoutFailure.Contains('timed out; acceptance remains ambiguous') 'The timeout path omitted its ambiguous-acceptance diagnostic.'
+    Write-Host 'PASS timed-out-publish-preserves-recovery'
+
+    $cancelledCase = Join-Path $tempRoot 'cancelled-publish'
+    [IO.Directory]::CreateDirectory((Join-Path $cancelledCase 'artifacts')) | Out-Null
+    $cancelledOutputPath = Join-Path $cancelledCase 'github-output.txt'
+    $cancelledAttemptPath = Join-Path $cancelledCase 'attempted.txt'
+    $cancelledRecoveryMarker = Join-Path $cancelledCase 'artifacts/.nuget-recovery-required'
+    $cancelledPrelude = @'
+import os
+import subprocess
+
+def cancelled_after_attempt(command, **kwargs):
+    with open(os.environ["ATTEMPT_MARKER"], "a", encoding="utf-8") as marker:
+        marker.write("attempted\n")
+    raise KeyboardInterrupt()
+
+subprocess.run = cancelled_after_attempt
+'@
+    [void](Invoke-PythonBlock `
+        -WorkingDirectory $cancelledCase `
+        -ScriptName 'publish-cancelled.py' `
+        -Script $publishScript `
+        -Prelude "$cancelledPrelude`n" `
+        -Environment @{
+            ATTEMPT_MARKER = $cancelledAttemptPath
+            GITHUB_OUTPUT = $cancelledOutputPath
+            NUGET_API_KEY = 'test-key-not-a-secret'
+        } `
+        -ExpectFailure)
+    $cancelledOutputs = Read-GitHubOutputs $cancelledOutputPath
+    Assert-Equal 'ambiguous' $cancelledOutputs['acceptance'] 'A cancelled publish did not retain ambiguous acceptance.'
+    Assert-Equal 1 ([IO.File]::ReadAllLines($cancelledAttemptPath).Length) 'The cancellation regression did not reach the network-attempt boundary exactly once.'
+    Assert-True (Test-Path -LiteralPath $cancelledRecoveryMarker -PathType Leaf) 'Cancellation removed the durable recovery marker.'
+    Assert-RecoveryGuard 'cancelled' $cancelledOutputs $cancelledRecoveryMarker $true 'A cancelled publish would not upload exact recovery state.'
+    Write-Host 'PASS cancelled-publish-preserves-recovery'
 
     $firstRelease = Invoke-ReleaseStateCase `
         -Name 'first-release' `

@@ -28,10 +28,12 @@ jobs:
       # Everything before it is cheap and reversible (build/test/pack, plus a LOCAL
       # commit+tag that is not yet pushed); everything after it (push the commit+tag
       # to main, create the GitHub Release) is reversible/recreatable and is made
-      # idempotent + retried. A failure before NuGet accepts the package leaves no
-      # remote or registry trace and may be re-run. Once NuGet accepts the package,
-      # never re-run or rebuild this release, even if the tag push failed: recover
-      # only from this run's immutable release-recovery-vX.Y.Z artifact.
+      # idempotent + retried. A structured terminal rejection proves that NuGet did
+      # not accept the package, leaves no remote trace, and may be re-run. A timeout,
+      # cancellation, or unclassified client failure after an attempt is ambiguous
+      # and preserves exact recovery state. Once NuGet accepts the package, never
+      # re-run or rebuild this release, even if the tag push failed: recover only
+      # from this run's immutable release-recovery-vX.Y.Z artifact.
       #
       # The "Push the release commit + tag" step pushes straight to main. If you
       # protect main with a rule that requires pull requests or status checks, that
@@ -389,9 +391,11 @@ jobs:
       # only if NuGet did not accept the package.
       # `--skip-duplicate` exits 0 when this exact version already exists on
       # nuget.org (HTTP 409), so an in-step retry remains safe if the registry
-      # accepted a previous attempt but its response was lost. If every client
-      # attempt fails, acceptance is ambiguous: the final step preserves this
-      # run's exact recovery state before the job terminates.
+      # accepted a previous attempt but its response was lost. An English,
+      # structured terminal 400/401/403/413/415/422 response on the first attempt
+      # proves rejection and leaves no remote recovery artifact. Every other failed,
+      # timed-out, or cancelled attempt remains ambiguous, so the final step
+      # preserves this run's exact recovery state before the job terminates.
       #
       # MORE SECURE ALTERNATIVE — NuGet Trusted Publishing (OIDC): instead of a
       # long-lived NUGET_API_KEY secret, mint a short-lived key per run. Add
@@ -408,42 +412,145 @@ jobs:
           python3 <<'PY'
           import os
           from pathlib import Path
+          import re
           import subprocess
           import sys
           import time
 
           output_path = Path(os.environ["GITHUB_OUTPUT"])
+          recovery_marker = Path("./artifacts/.nuget-recovery-required")
+          confirmed_rejection = re.compile(
+              r"Response status code does not indicate success:\s*"
+              r"(?:400|401|403|413|415|422)\b",
+              re.IGNORECASE,
+          )
 
           def write_output(name, value):
               with output_path.open("a", encoding="utf-8") as output:
                   output.write(f"{name}={value}\n")
 
-          write_output("acceptance", "not-attempted")
-          write_output("recovery_required", "false")
+          def require_recovery(required):
+              write_output("recovery_required", "true" if required else "false")
+              if required:
+                  recovery_marker.touch()
+              else:
+                  recovery_marker.unlink(missing_ok=True)
 
-          command = [
+          def emit_text(value, stream):
+              if not value:
+                  return
+              if isinstance(value, bytes):
+                  value = value.decode("utf-8", errors="replace")
+              stream.write(value)
+
+          def emit_process_output(result):
+              emit_text(result.stdout, sys.stdout)
+              emit_text(result.stderr, sys.stderr)
+
+          write_output("acceptance", "not-attempted")
+          require_recovery(False)
+
+          package_command = [
               "dotnet", "nuget", "push", "./artifacts/*.nupkg",
               "--source", "https://api.nuget.org/v3/index.json",
               "--api-key", os.environ["NUGET_API_KEY"],
               "--skip-duplicate",
+              "--no-symbols",
+              "--force-english-output",
           ]
+          package_accepted = False
           for attempt in range(1, 4):
               if attempt == 1:
-                  # A failed client response cannot prove that the server rejected
-                  # the immutable package bytes, so fail safe from the first attempt.
+                  # This durable local marker survives process cancellation even if
+                  # the runner cannot finalize step outputs.
                   write_output("acceptance", "ambiguous")
-                  write_output("recovery_required", "true")
-              if subprocess.run(command, check=False).returncode == 0:
-                  write_output("acceptance", "accepted")
-                  print(f"NuGet push succeeded (attempt {attempt}).")
-                  sys.exit(0)
-              print(f"::warning::NuGet push attempt {attempt} failed; retrying after backoff...")
-              time.sleep(attempt * 15)
+                  require_recovery(True)
+              try:
+                  result = subprocess.run(
+                      package_command,
+                      check=False,
+                      capture_output=True,
+                      text=True,
+                      timeout=300,
+                  )
+              except subprocess.TimeoutExpired as error:
+                  emit_text(error.stdout, sys.stdout)
+                  emit_text(error.stderr, sys.stderr)
+                  print(f"::warning::NuGet push attempt {attempt} timed out; acceptance remains ambiguous.")
+                  if attempt < 3:
+                      time.sleep(attempt * 15)
+                  continue
 
-          print("::error::NuGet push failed after 3 attempts. No VCS push or GitHub Release was attempted.")
-          print("::error::NuGet acceptance is ambiguous; the exact recovery state will be preserved by the final step.")
-          print("::error::Do not re-run or rebuild unless the version is confirmed absent on nuget.org.")
-          print("::error::If NuGet accepted it, recover only from this run's immutable artifact.")
+              emit_process_output(result)
+              if result.returncode == 0:
+                  write_output("acceptance", "accepted")
+                  package_accepted = True
+                  print(f"NuGet package push succeeded (attempt {attempt}).")
+                  break
+
+              response = f"{result.stdout or ''}\n{result.stderr or ''}"
+              if attempt == 1 and confirmed_rejection.search(response):
+                  write_output("acceptance", "rejected")
+                  require_recovery(False)
+                  print(
+                      "::error::NuGet conclusively rejected the package; no registry, "
+                      "VCS, Release, or recovery-artifact trace was created."
+                  )
+                  print("::error::Correct the rejection and re-run the workflow from a fresh release state.")
+                  sys.exit(1)
+
+              print(f"::warning::NuGet push attempt {attempt} failed; acceptance remains ambiguous.")
+              if attempt < 3:
+                  time.sleep(attempt * 15)
+
+          if not package_accepted:
+              print("::error::NuGet push failed after 3 attempts. No VCS push or GitHub Release was attempted.")
+              print(
+                  "::error::NuGet acceptance is ambiguous; the exact recovery state "
+                  "will be preserved by the final step."
+              )
+              print("::error::Do not re-run or rebuild unless the version is confirmed absent on nuget.org.")
+              print("::error::If NuGet accepted it, recover only from this run's immutable artifact.")
+              sys.exit(1)
+
+          # Publish symbols separately only after the main package is accepted. Any
+          # symbol failure is therefore post-pivot and can never be classified as a
+          # no-trace rejection of the immutable main package.
+          symbol_command = [
+              "dotnet", "nuget", "push", "./artifacts/*.snupkg",
+              "--source", "https://api.nuget.org/v3/index.json",
+              "--api-key", os.environ["NUGET_API_KEY"],
+              "--skip-duplicate",
+              "--no-symbols",
+              "--force-english-output",
+          ]
+          for attempt in range(1, 4):
+              try:
+                  result = subprocess.run(
+                      symbol_command,
+                      check=False,
+                      capture_output=True,
+                      text=True,
+                      timeout=300,
+                  )
+              except subprocess.TimeoutExpired as error:
+                  emit_text(error.stdout, sys.stdout)
+                  emit_text(error.stderr, sys.stderr)
+                  print(f"::warning::NuGet symbol push attempt {attempt} timed out after package acceptance.")
+                  if attempt < 3:
+                      time.sleep(attempt * 15)
+                  continue
+
+              emit_process_output(result)
+              if result.returncode == 0:
+                  print(f"NuGet symbol push succeeded (attempt {attempt}).")
+                  sys.exit(0)
+              print(f"::warning::NuGet symbol push attempt {attempt} failed after package acceptance.")
+              if attempt < 3:
+                  time.sleep(attempt * 15)
+
+          print("::error::The package is ALREADY on nuget.org, but its symbol package did not complete successfully.")
+          print("::error::No VCS push or GitHub Release was attempted; use this run's exact recovery artifact.")
           sys.exit(1)
           PY
 
@@ -515,15 +622,20 @@ jobs:
           exit 1
 
       # Runs after an accepted publish followed by a later failure, or after an
-      # attempted publish whose terminal client failure leaves acceptance ambiguous.
+      # attempted publish whose failure, timeout, or cancellation leaves acceptance
+      # ambiguous. The marker is authoritative when cancellation prevents the runner
+      # from finalizing step outputs. A confirmed rejection removes both guards.
       # Persist the exact package, notes, checksums, and local release commit/tag so
       # recovery never rebuilds or substitutes post-pivot artifacts. Failures before
       # the first publish attempt leave recovery-required false (or the step skipped).
       - name: Preserve exact post-pivot recovery state
         if: >-
           ${{
-            always() && failure() &&
-            steps.nuget_publish.outputs.recovery_required == 'true'
+            always() && (failure() || cancelled()) &&
+            (
+              steps.nuget_publish.outputs.recovery_required == 'true' ||
+              hashFiles('artifacts/.nuget-recovery-required') != ''
+            )
           }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

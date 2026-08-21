@@ -167,12 +167,14 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
   promotes the Unreleased changelog entries into that version's section, and derives
   release notes from that section; the package, local commit, and local tag therefore
   use one release state. It then publishes the package and only after success pushes
-  the commit+tag to `main`. Re-run only when NuGet did not accept the package. A
-  terminal client failure is ambiguous, so the workflow preserves the exact packages,
-  notes, checksums, and local release tag as a `release-recovery-vX.Y.Z` artifact; do
-  not re-run until the version is confirmed absent. If NuGet accepted it, use that
-  immutable artifact instead of rebuilding regardless of what the publish client or
-  later steps reported (see `.github/workflows/release.yml`).
+  the commit+tag to `main`. A structured terminal rejection proves that NuGet did not
+  accept the package and leaves no remote recovery artifact. A timeout, cancellation,
+  or unclassified client failure after an attempt is ambiguous, so the workflow
+  preserves the exact packages, notes, checksums, and local release tag as a
+  `release-recovery-vX.Y.Z` artifact; do not re-run until the version is confirmed
+  absent. If NuGet accepted it, use that immutable artifact instead of rebuilding
+  regardless of what the publish client or later steps reported (see
+  `.github/workflows/release.yml`).
 
 ## Recommended add-ons (not enabled by default)
 
