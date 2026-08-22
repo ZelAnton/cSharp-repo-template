@@ -85,7 +85,9 @@ assumptions a past agent got wrong:
    initializer loads and validates the complete `scripts/init-plan.tsv` plan and
    rejects every existing destination, including `.claude/settings.json`. It
    also rejects symlink, junction, and other reparse-point components in planned
-   sources, destinations, and their existing ancestors. If an I/O error still
+   sources, destinations, and their existing ancestors. Content updates replace
+   the repository entry instead of writing through it, so an external hard-linked
+   peer remains unchanged. If an I/O error still
    occurs after preflight, the mutation journal restores the complete original
    tree before the initializer reports failure.
    `content` entries are the exact substitution boundary; no recursive scan is

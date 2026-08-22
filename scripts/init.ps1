@@ -228,6 +228,59 @@ function Assert-FileCanBeChanged([pscustomobject]$path, [string]$role) {
     }
 }
 
+function Set-FileContentSafely(
+    [pscustomobject]$path,
+    [string]$content,
+    [Text.Encoding]$encoding
+) {
+    $item = Get-Item -LiteralPath $path.FullPath -Force
+    $temporaryPath = Join-Path ([IO.Path]::GetDirectoryName($path.FullPath)) ".csharp-template-init-$([Guid]::NewGuid().ToString('N')).tmp"
+    $writer = $null
+    try {
+        $stream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $writer = [IO.StreamWriter]::new($stream, $encoding)
+        $writer.Write($content)
+        $writer.Dispose()
+        $writer = $null
+
+        [IO.File]::SetAttributes($temporaryPath, $item.Attributes)
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($temporaryPath, [IO.File]::GetUnixFileMode($path.FullPath))
+        }
+
+        # Replacing the directory entry prevents a hard-linked peer outside the repository from being truncated.
+        [IO.File]::Move($temporaryPath, $path.FullPath, $true)
+    }
+    finally {
+        if ($writer) {
+            $writer.Dispose()
+        }
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Restore-FileSafely([pscustomobject]$backup) {
+    $temporaryPath = Join-Path ([IO.Path]::GetDirectoryName($backup.Original)) ".csharp-template-init-$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::Copy($backup.Backup, $temporaryPath, $false)
+        [IO.File]::SetAttributes($temporaryPath, $backup.Attributes)
+        if (-not $IsWindows) {
+            [IO.File]::SetUnixFileMode($temporaryPath, $backup.UnixFileMode)
+        }
+        [IO.File]::SetLastWriteTimeUtc($temporaryPath, $backup.LastWriteTimeUtc)
+
+        # Rollback also replaces the entry so a raced or original hard link is never written through.
+        [IO.File]::Move($temporaryPath, $backup.Original, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Assert-DirectoryCanBeChanged([string]$fullPath, [string]$relative, [string]$role) {
     $current = $fullPath
     while (-not (Test-Path -LiteralPath $current)) {
@@ -457,12 +510,13 @@ try {
             Backup = $backup
             Attributes = $item.Attributes
             LastWriteTimeUtc = $item.LastWriteTimeUtc
+            UnixFileMode = if ($IsWindows) { $null } else { [IO.File]::GetUnixFileMode($original) }
         }
     }
 
     foreach ($write in $contentWrites) {
         Assert-NoReparsePoint $write.Path 'content source'
-        [IO.File]::WriteAllText($write.Path.FullPath, $write.Content, $utf8NoBom)
+        Set-FileContentSafely $write.Path $write.Content $utf8NoBom
     }
     Write-Host "    Updated contents in $($contentWrites.Count) file(s)." -ForegroundColor DarkGray
 
@@ -555,13 +609,7 @@ catch {
     }
     foreach ($backup in $backupRecords) {
         try {
-            $existing = Get-Item -LiteralPath $backup.Original -Force -ErrorAction SilentlyContinue
-            if ($existing -and ($existing.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-                Remove-Item -LiteralPath $backup.Original -Force
-            }
-            [IO.File]::Copy($backup.Backup, $backup.Original, $true)
-            [IO.File]::SetAttributes($backup.Original, $backup.Attributes)
-            [IO.File]::SetLastWriteTimeUtc($backup.Original, $backup.LastWriteTimeUtc)
+            Restore-FileSafely $backup
         }
         catch {
             $rollbackErrors.Add($_.Exception.Message)

@@ -308,10 +308,56 @@ function Test-LinkSafety([string]$initializer, [string]$linkKind) {
     Assert-True (@(Compare-Object $externalBefore $externalAfter).Count -eq 0) "$initializer changed the external $linkKind target."
 }
 
+function Test-HardLinkContentIsolation([string]$initializer) {
+    $projectName = 'Acme.HardLinkSafety'
+    $root = Join-Path $tempRoot "hard-link-$initializer"
+    $externalRoot = Join-Path $tempRoot "external-hard-link-$initializer"
+    Copy-Template $root
+    [IO.Directory]::CreateDirectory($externalRoot) | Out-Null
+
+    $internalPath = Join-Path $root 'README.md'
+    $externalPath = Join-Path $externalRoot 'README.md'
+    [IO.File]::Copy($internalPath, $externalPath)
+    Remove-Item -LiteralPath $internalPath -Force
+    New-Item -ItemType HardLink -Path $internalPath -Target $externalPath | Out-Null
+
+    $externalBefore = Get-TreeSnapshot $externalRoot
+    if ($initializer -eq 'pwsh') {
+        $null = Invoke-Native 'pwsh' @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $projectName,
+            '-Author', 'Hard Link Author',
+            '-AuthorEmail', 'hard-link@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Hard-link isolation regression',
+            '-Year', '2042',
+            '-KeepScript'
+        ) $root
+    }
+    else {
+        $null = Invoke-BashInitializer $root $projectName 'Hard Link Author' 'hard-link@example.invalid' 'safe-owner' 'Hard-link isolation regression' '2042'
+    }
+
+    $externalAfter = Get-TreeSnapshot $externalRoot
+    Assert-True (@(Compare-Object $externalBefore $externalAfter).Count -eq 0) "$initializer changed the external hard-linked target."
+    Assert-True ([IO.File]::ReadAllText($internalPath).Contains($projectName)) "$initializer did not update the repository-side hard link."
+    [IO.File]::WriteAllText($internalPath, "repository only`n", $utf8NoBom)
+    Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer left the repository file linked to the external target."
+}
+
 function Test-LateFailureRollback([string]$initializer) {
     $projectName = 'Acme.Rollback'
     $root = Join-Path $tempRoot "rollback-$initializer"
+    $externalRoot = Join-Path $tempRoot "rollback-external-$initializer"
     Copy-Template $root
+    [IO.Directory]::CreateDirectory($externalRoot) | Out-Null
+    $internalHardLink = Join-Path $root 'README.md'
+    $externalHardLink = Join-Path $externalRoot 'README.md'
+    [IO.File]::Copy($internalHardLink, $externalHardLink)
+    Remove-Item -LiteralPath $internalHardLink -Force
+    New-Item -ItemType HardLink -Path $internalHardLink -Target $externalHardLink | Out-Null
+    $externalBefore = Get-TreeSnapshot $externalRoot
 
     if ($initializer -eq 'pwsh') {
         $wrapper = Join-Path $tempRoot 'late-failure-wrapper.ps1'
@@ -356,6 +402,9 @@ Set-Location $Root
 #!/usr/bin/env bash
 state='/tmp/$stateName'
 count=0
+if [ "`$1" = '-f' ]; then
+  exec '$realMove' "`$@"
+fi
 [ ! -f "`$state" ] || count="`$(cat "`$state")"
 count=`$((count + 1))
 printf '%s' "`$count" > "`$state"
@@ -375,6 +424,9 @@ exec '$realMove' "`$@"
     $after = Get-TreeSnapshot $root
     Assert-True ($result.Output -match '(?i)(rolled back|rollback)') "$initializer did not report rollback after the late failure."
     Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer did not restore the complete tree after the late failure."
+    Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer rollback changed the external hard-linked target."
+    [IO.File]::WriteAllText($internalHardLink, "repository rollback only`n", $utf8NoBom)
+    Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer rollback left the repository file linked to the external target."
 }
 
 function Get-WorkflowIdentityEnvironment([string]$root) {
@@ -786,6 +838,8 @@ try {
     Test-LinkSafety 'bash' 'file'
     Test-LinkSafety 'pwsh' 'directory'
     Test-LinkSafety 'bash' 'directory'
+    Test-HardLinkContentIsolation 'pwsh'
+    Test-HardLinkContentIsolation 'bash'
     Test-LateFailureRollback 'pwsh'
     Test-LateFailureRollback 'bash'
 

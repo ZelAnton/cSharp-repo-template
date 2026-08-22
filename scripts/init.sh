@@ -336,10 +336,7 @@ rollback_transaction() {
   for ((i = 0; i < ${#backup_originals[@]}; i++)); do
     original="${backup_originals[$i]}"
     backup="${backup_copies[$i]}"
-    if [ -L "$original" ]; then
-      rm -f -- "$original" || rollback_failed=1
-    fi
-    cp -p -- "$backup" "$original" || rollback_failed=1
+    restore_file "$backup" "$original" || rollback_failed=1
   done
   for ((i = ${#created_directories[@]} - 1; i >= 0; i--)); do
     rmdir -- "${created_directories[$i]}" 2>/dev/null || true
@@ -370,6 +367,38 @@ backup_file() {
   backup_copies[${#backup_copies[@]}]="$backup"
 }
 
+replace_file_content() {
+  local original="$1"
+  local content="$2"
+  local temporary
+  temporary="$(mktemp "$(dirname "$original")/.csharp-template-init.XXXXXXXX")"
+  if ! cp -p -- "$original" "$temporary" || ! printf '%s' "$content" > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  # Replacing the directory entry prevents a hard-linked peer outside the repository from being truncated.
+  if ! mv -f -- "$temporary" "$original"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+restore_file() {
+  local backup="$1"
+  local original="$2"
+  local temporary
+  temporary="$(mktemp "$(dirname "$original")/.csharp-template-init.XXXXXXXX")"
+  if ! cp -p -- "$backup" "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  # Rollback uses the same replacement rule and never writes through an existing hard link.
+  if ! mv -f -- "$temporary" "$original"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
 for path in "${content_paths[@]-}" "${remove_paths[@]-}"; do
   if [ -n "$path" ] && [ -f "$path" ]; then
     backup_file "$path"
@@ -386,7 +415,7 @@ fi
 for ((i = 0; i < ${#content_paths[@]}; i++)); do
   relative="${content_paths[$i]#"$repo_root/"}"
   assert_no_link_components "$relative" "content source"
-  printf '%s' "${content_values[$i]}" > "${content_paths[$i]}"
+  replace_file_content "${content_paths[$i]}" "${content_values[$i]}"
 done
 echo "    Updated contents in ${#content_paths[@]} file(s)."
 

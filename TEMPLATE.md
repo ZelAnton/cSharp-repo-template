@@ -58,7 +58,8 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    - stops before the first mutation if any planned destination already exists,
      including a generated solution/project path or `.claude/settings.json`, and
      rejects symlink, junction, or other reparse-point components in every
-     planned source and destination;
+     planned source and destination; content updates replace their repository
+     entry so an external hard-linked peer is never written through;
    - restores the complete original tree if an I/O failure still occurs after
      preflight while content, paths, or template-only files are being changed;
    - replaces all placeholder tokens in one pass, so placeholder-like text inside
