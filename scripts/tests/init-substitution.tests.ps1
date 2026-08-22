@@ -23,6 +23,47 @@ function Assert-True([bool]$condition, [string]$message) {
     }
 }
 
+function Get-FileSecurityDescriptor([string]$path) {
+    $sections =
+        [Security.AccessControl.AccessControlSections]::Owner -bor
+        [Security.AccessControl.AccessControlSections]::Group -bor
+        [Security.AccessControl.AccessControlSections]::Access
+    $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($path), $sections)
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new(
+        $security.GetSecurityDescriptorSddlForm($sections)
+    )
+    $accessRules = @(
+        foreach ($rule in $descriptor.DiscretionaryAcl) {
+            $binary = [byte[]]::new($rule.BinaryLength)
+            $rule.GetBinaryForm($binary, 0)
+            [Convert]::ToHexString($binary)
+        }
+    ) | Sort-Object
+    return "$($descriptor.Owner.Value):$($descriptor.Group.Value):$([int]$descriptor.ControlFlags):$($accessRules -join ',')"
+}
+
+function Protect-FileAccessRules([string]$path) {
+    $sections =
+        [Security.AccessControl.AccessControlSections]::Owner -bor
+        [Security.AccessControl.AccessControlSections]::Group -bor
+        [Security.AccessControl.AccessControlSections]::Access
+    $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($path), $sections)
+    $security.SetAccessRuleProtection($true, $true)
+    [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($path), $security)
+}
+
+function Get-FileMetadataSnapshot([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force
+    $permissions = if ($IsWindows) {
+        Get-FileSecurityDescriptor $path
+    }
+    else {
+        [int][IO.File]::GetUnixFileMode($path)
+    }
+    $creationTime = if ($IsWindows) { $item.CreationTimeUtc.Ticks } else { '' }
+    return "$([int64]$item.Attributes):$creationTime`:$($item.LastWriteTimeUtc.Ticks):$permissions"
+}
+
 function Invoke-Native(
     [string]$filePath,
     [string[]]$arguments,
@@ -173,7 +214,13 @@ function Get-TreeSnapshot([string]$root) {
         }
         else {
             $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
-            $entries += "F:$relative`:$hash`:$([int64]$item.Attributes)"
+            $permissions = if ($IsWindows) {
+                Get-FileSecurityDescriptor $item.FullName
+            }
+            else {
+                [int][IO.File]::GetUnixFileMode($item.FullName)
+            }
+            $entries += "F:$relative`:$hash`:$([int64]$item.Attributes):$permissions"
         }
     }
     return @($entries | Sort-Object)
@@ -320,8 +367,12 @@ function Test-HardLinkContentIsolation([string]$initializer) {
     [IO.File]::Copy($internalPath, $externalPath)
     Remove-Item -LiteralPath $internalPath -Force
     New-Item -ItemType HardLink -Path $internalPath -Target $externalPath | Out-Null
+    if ($IsWindows -and $initializer -eq 'pwsh') {
+        Protect-FileAccessRules $internalPath
+    }
 
     $externalBefore = Get-TreeSnapshot $externalRoot
+    $internalMetadataBefore = Get-FileMetadataSnapshot $internalPath
     if ($initializer -eq 'pwsh') {
         $null = Invoke-Native 'pwsh' @(
             '-NoProfile',
@@ -342,6 +393,9 @@ function Test-HardLinkContentIsolation([string]$initializer) {
     $externalAfter = Get-TreeSnapshot $externalRoot
     Assert-True (@(Compare-Object $externalBefore $externalAfter).Count -eq 0) "$initializer changed the external hard-linked target."
     Assert-True ([IO.File]::ReadAllText($internalPath).Contains($projectName)) "$initializer did not update the repository-side hard link."
+    if (-not $IsWindows -or $initializer -eq 'pwsh') {
+        Assert-Equal $internalMetadataBefore (Get-FileMetadataSnapshot $internalPath) "$initializer did not preserve repository file metadata."
+    }
     [IO.File]::WriteAllText($internalPath, "repository only`n", $utf8NoBom)
     Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer left the repository file linked to the external target."
 }
@@ -357,7 +411,11 @@ function Test-LateFailureRollback([string]$initializer) {
     [IO.File]::Copy($internalHardLink, $externalHardLink)
     Remove-Item -LiteralPath $internalHardLink -Force
     New-Item -ItemType HardLink -Path $internalHardLink -Target $externalHardLink | Out-Null
+    if ($IsWindows -and $initializer -eq 'pwsh') {
+        Protect-FileAccessRules $internalHardLink
+    }
     $externalBefore = Get-TreeSnapshot $externalRoot
+    $internalMetadataBefore = Get-FileMetadataSnapshot $internalHardLink
 
     if ($initializer -eq 'pwsh') {
         $wrapper = Join-Path $tempRoot 'late-failure-wrapper.ps1'
@@ -424,6 +482,9 @@ exec '$realMove' "`$@"
     $after = Get-TreeSnapshot $root
     Assert-True ($result.Output -match '(?i)(rolled back|rollback)') "$initializer did not report rollback after the late failure."
     Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer did not restore the complete tree after the late failure."
+    if (-not $IsWindows -or $initializer -eq 'pwsh') {
+        Assert-Equal $internalMetadataBefore (Get-FileMetadataSnapshot $internalHardLink) "$initializer rollback did not restore repository file metadata."
+    }
     Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer rollback changed the external hard-linked target."
     [IO.File]::WriteAllText($internalHardLink, "repository rollback only`n", $utf8NoBom)
     Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer rollback left the repository file linked to the external target."

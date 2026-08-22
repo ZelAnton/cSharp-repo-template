@@ -372,7 +372,9 @@ replace_file_content() {
   local content="$2"
   local temporary
   temporary="$(mktemp "$(dirname "$original")/.csharp-template-init.XXXXXXXX")"
-  if ! cp -p -- "$original" "$temporary" || ! printf '%s' "$content" > "$temporary"; then
+  if ! cp -p -- "$original" "$temporary" ||
+    ! printf '%s' "$content" > "$temporary" ||
+    ! touch -r "$original" "$temporary"; then
     rm -f -- "$temporary"
     return 1
   fi

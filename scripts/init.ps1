@@ -228,12 +228,77 @@ function Assert-FileCanBeChanged([pscustomobject]$path, [string]$role) {
     }
 }
 
+function Get-FileMetadata([string]$fullPath) {
+    $item = Get-Item -LiteralPath $fullPath -Force
+    $securityDescriptor = $null
+    if ($IsWindows) {
+        $sections =
+            [Security.AccessControl.AccessControlSections]::Owner -bor
+            [Security.AccessControl.AccessControlSections]::Group -bor
+            [Security.AccessControl.AccessControlSections]::Access
+        try {
+            $security = [IO.FileSystemAclExtensions]::GetAccessControl(
+                [IO.FileInfo]::new($fullPath),
+                $sections
+            )
+            $securityDescriptor = $security.GetSecurityDescriptorSddlForm($sections)
+        }
+        catch {
+            throw "File security metadata cannot be read: $fullPath. No files were changed."
+        }
+    }
+
+    return [pscustomobject]@{
+        Attributes = $item.Attributes
+        CreationTimeUtc = if ($IsWindows) { $item.CreationTimeUtc } else { $null }
+        LastAccessTimeUtc = $item.LastAccessTimeUtc
+        LastWriteTimeUtc = $item.LastWriteTimeUtc
+        UnixFileMode = if ($IsWindows) { $null } else { [IO.File]::GetUnixFileMode($fullPath) }
+        SecurityDescriptor = $securityDescriptor
+    }
+}
+
+function Set-FileMetadata([string]$fullPath, [pscustomobject]$metadata) {
+    if ($IsWindows) {
+        $sections =
+            [Security.AccessControl.AccessControlSections]::Owner -bor
+            [Security.AccessControl.AccessControlSections]::Group -bor
+            [Security.AccessControl.AccessControlSections]::Access
+        try {
+            $security = [Security.AccessControl.FileSecurity]::new()
+            $security.SetSecurityDescriptorSddlForm($metadata.SecurityDescriptor, $sections)
+            [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($fullPath), $security)
+        }
+        catch {
+            throw "File security metadata cannot be preserved: $fullPath."
+        }
+        [IO.File]::SetCreationTimeUtc($fullPath, $metadata.CreationTimeUtc)
+    }
+    else {
+        [IO.File]::SetUnixFileMode($fullPath, $metadata.UnixFileMode)
+    }
+
+    [IO.File]::SetLastAccessTimeUtc($fullPath, $metadata.LastAccessTimeUtc)
+    [IO.File]::SetLastWriteTimeUtc($fullPath, $metadata.LastWriteTimeUtc)
+    [IO.File]::SetAttributes($fullPath, $metadata.Attributes)
+}
+
+function Set-PostReplacementMetadata([string]$fullPath, [pscustomobject]$metadata) {
+    if ($IsWindows) {
+        # NTFS name tunneling can replace the prepared file's creation time during the move.
+        [IO.File]::SetCreationTimeUtc($fullPath, $metadata.CreationTimeUtc)
+    }
+    [IO.File]::SetLastAccessTimeUtc($fullPath, $metadata.LastAccessTimeUtc)
+    [IO.File]::SetLastWriteTimeUtc($fullPath, $metadata.LastWriteTimeUtc)
+    [IO.File]::SetAttributes($fullPath, $metadata.Attributes)
+}
+
 function Set-FileContentSafely(
     [pscustomobject]$path,
     [string]$content,
     [Text.Encoding]$encoding
 ) {
-    $item = Get-Item -LiteralPath $path.FullPath -Force
+    $metadata = Get-FileMetadata $path.FullPath
     $temporaryPath = Join-Path ([IO.Path]::GetDirectoryName($path.FullPath)) ".csharp-template-init-$([Guid]::NewGuid().ToString('N')).tmp"
     $writer = $null
     try {
@@ -243,13 +308,11 @@ function Set-FileContentSafely(
         $writer.Dispose()
         $writer = $null
 
-        [IO.File]::SetAttributes($temporaryPath, $item.Attributes)
-        if (-not $IsWindows) {
-            [IO.File]::SetUnixFileMode($temporaryPath, [IO.File]::GetUnixFileMode($path.FullPath))
-        }
+        Set-FileMetadata $temporaryPath $metadata
 
         # Replacing the directory entry prevents a hard-linked peer outside the repository from being truncated.
         [IO.File]::Move($temporaryPath, $path.FullPath, $true)
+        Set-PostReplacementMetadata $path.FullPath $metadata
     }
     finally {
         if ($writer) {
@@ -265,14 +328,11 @@ function Restore-FileSafely([pscustomobject]$backup) {
     $temporaryPath = Join-Path ([IO.Path]::GetDirectoryName($backup.Original)) ".csharp-template-init-$([Guid]::NewGuid().ToString('N')).tmp"
     try {
         [IO.File]::Copy($backup.Backup, $temporaryPath, $false)
-        [IO.File]::SetAttributes($temporaryPath, $backup.Attributes)
-        if (-not $IsWindows) {
-            [IO.File]::SetUnixFileMode($temporaryPath, $backup.UnixFileMode)
-        }
-        [IO.File]::SetLastWriteTimeUtc($temporaryPath, $backup.LastWriteTimeUtc)
+        Set-FileMetadata $temporaryPath $backup.Metadata
 
         # Rollback also replaces the entry so a raced or original hard link is never written through.
         [IO.File]::Move($temporaryPath, $backup.Original, $true)
+        Set-PostReplacementMetadata $backup.Original $backup.Metadata
     }
     finally {
         if (Test-Path -LiteralPath $temporaryPath) {
@@ -502,15 +562,13 @@ try {
         if (-not $backedUp.Add($original)) {
             continue
         }
-        $item = Get-Item -LiteralPath $original -Force
+        $metadata = Get-FileMetadata $original
         $backup = Join-Path $stagingRoot "$($backupRecords.Count).bak"
         [IO.File]::Copy($original, $backup, $false)
         $backupRecords += [pscustomobject]@{
             Original = $original
             Backup = $backup
-            Attributes = $item.Attributes
-            LastWriteTimeUtc = $item.LastWriteTimeUtc
-            UnixFileMode = if ($IsWindows) { $null } else { [IO.File]::GetUnixFileMode($original) }
+            Metadata = $metadata
         }
     }
 
