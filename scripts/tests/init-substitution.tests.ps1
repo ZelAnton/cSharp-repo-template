@@ -1000,6 +1000,56 @@ function Test-RequiredOptionValues {
     Test-RejectedOptionValue 'pwsh' 'year-empty' @('-ProjectName', 'Acme.RequiredValues', '-Year', '', '-KeepScript') '-Year'
 }
 
+function Test-BashOptionShapedValueBoundary {
+    $optionCases = @(
+        @{ Case = 'project-name'; Option = '--project-name' },
+        @{ Case = 'author'; Option = '--author' },
+        @{ Case = 'author-email'; Option = '--author-email' },
+        @{ Case = 'github-owner'; Option = '--github-owner' },
+        @{ Case = 'description'; Option = '--description' },
+        @{ Case = 'year'; Option = '--year' }
+    )
+    $followingOptions = @(
+        @{ Case = 'help'; Value = '-h' },
+        @{ Case = 'unknown-short'; Value = '-x' },
+        @{ Case = 'unknown-long'; Value = '--unknown-option' }
+    )
+
+    foreach ($optionCase in $optionCases) {
+        $prefix = if ($optionCase.Case -eq 'project-name') { @() } else { @('--project-name', 'Acme.OptionBoundary') }
+        foreach ($followingOption in $followingOptions) {
+            Test-RejectedOptionValue `
+                'bash' `
+                "$($optionCase.Case)-$($followingOption.Case)" `
+                ($prefix + $optionCase.Option + $followingOption.Value) `
+                $optionCase.Option
+        }
+    }
+
+    $projectName = 'Acme.NegativeYearBoundary'
+    $pwshRoot = Join-Path $tempRoot 'negative-year-boundary-pwsh'
+    $bashRoot = Join-Path $tempRoot 'negative-year-boundary-bash'
+    Copy-Template $pwshRoot
+    Copy-Template $bashRoot
+
+    $null = Invoke-Native 'pwsh' @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', $projectName,
+        '-Year', '-2147483648',
+        '-KeepScript'
+    ) $pwshRoot
+    $null = Invoke-Native 'bash' @(
+        './scripts/init.sh',
+        '--project-name', $projectName,
+        '--year', '-2147483648',
+        '--keep-script'
+    ) $bashRoot
+
+    Assert-TreesEqual $pwshRoot $bashRoot
+    Assert-True (Test-Path -LiteralPath (Join-Path $bashRoot "src/$projectName/$projectName.csproj")) 'Bash rejected the negative signed Int32 boundary for --year.'
+}
+
 function Test-OptionalEmptyValuesUseFallbacks {
     $optionCases = @(
         @{ Case = 'author'; Bash = '--author'; PowerShell = '-Author' },
@@ -1412,6 +1462,7 @@ try {
     Test-RejectedInput 'pwsh' 'owner'
     Test-RejectedInput 'bash' 'owner'
     Test-RequiredOptionValues
+    Test-BashOptionShapedValueBoundary
     Test-OptionalEmptyValuesUseFallbacks
     Test-KeepScriptAfterValueOption
     $invalidProjectNames = @(

@@ -43,7 +43,16 @@ read_option_value() {
     die "$option requires a value. No files were changed."
   fi
   case "$2" in
-    --*|-h) die "$option requires a value before option '$2'. No files were changed." ;;
+    -*)
+      if [ "$option" = "--year" ]; then
+        case "${2#-}" in
+          ""|*[!0-9]*) die "$option requires a value before option '$2'. No files were changed." ;;
+          *) ;;
+        esac
+      else
+        die "$option requires a value before option '$2'. No files were changed."
+      fi
+      ;;
   esac
   option_value="$2"
 }
