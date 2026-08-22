@@ -942,6 +942,88 @@ function Test-RejectedInput([string]$initializer, [string]$field) {
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'INJECTED'))) 'Rejected input executed a command.'
 }
 
+function Test-RejectedOptionValue(
+    [string]$initializer,
+    [string]$caseName,
+    [string[]]$arguments,
+    [string]$expectedOption
+) {
+    $root = Join-Path $tempRoot "reject-option-value-$initializer-$caseName"
+    Copy-Template $root
+    Add-LocalData $root
+    $before = Get-TreeSnapshot $root
+
+    $result = if ($initializer -eq 'pwsh') {
+        Invoke-Native 'pwsh' (@('-NoProfile', '-File', './scripts/init.ps1') + $arguments) $root -ExpectFailure
+    }
+    else {
+        Invoke-Native 'bash' (@('./scripts/init.sh') + $arguments) $root -ExpectFailure
+    }
+    $after = Get-TreeSnapshot $root
+    $optionName = $expectedOption.TrimStart('-')
+
+    Assert-True ($result.Output -match [regex]::Escape($optionName)) "$initializer did not name $expectedOption in its missing/invalid-value diagnostic: $($result.Output)"
+    Assert-True ($result.Output -notmatch 'Preflight validated') "$initializer entered preflight after rejecting $expectedOption."
+    Assert-True ($result.Output -notmatch '(?i)rollback') "$initializer attempted rollback after rejecting $expectedOption before mutation."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the tree after rejecting $expectedOption."
+}
+
+function Test-RequiredOptionValues {
+    $optionCases = @(
+        @{ Case = 'project-name'; Bash = '--project-name'; PowerShell = '-ProjectName' },
+        @{ Case = 'author'; Bash = '--author'; PowerShell = '-Author' },
+        @{ Case = 'author-email'; Bash = '--author-email'; PowerShell = '-AuthorEmail' },
+        @{ Case = 'github-owner'; Bash = '--github-owner'; PowerShell = '-GitHubOwner' },
+        @{ Case = 'description'; Bash = '--description'; PowerShell = '-Description' },
+        @{ Case = 'year'; Bash = '--year'; PowerShell = '-Year' }
+    )
+
+    foreach ($optionCase in $optionCases) {
+        $bashPrefix = if ($optionCase.Case -eq 'project-name') { @() } else { @('--project-name', 'Acme.RequiredValues') }
+        $pwshPrefix = if ($optionCase.Case -eq 'project-name') { @() } else { @('-ProjectName', 'Acme.RequiredValues') }
+
+        Test-RejectedOptionValue 'bash' "$($optionCase.Case)-end" ($bashPrefix + $optionCase.Bash) $optionCase.Bash
+        Test-RejectedOptionValue 'bash' "$($optionCase.Case)-next" ($bashPrefix + $optionCase.Bash + '--keep-script') $optionCase.Bash
+        Test-RejectedOptionValue 'pwsh' "$($optionCase.Case)-end" ($pwshPrefix + $optionCase.PowerShell) $optionCase.PowerShell
+        Test-RejectedOptionValue 'pwsh' "$($optionCase.Case)-next" ($pwshPrefix + $optionCase.PowerShell + '-KeepScript') $optionCase.PowerShell
+    }
+
+    foreach ($invalidYear in @('not-a-year', '2147483648', '-2147483649')) {
+        $caseName = "year-invalid-$($invalidYear.Replace('-', 'minus'))"
+        Test-RejectedOptionValue 'bash' $caseName @('--project-name', 'Acme.RequiredValues', '--year', $invalidYear, '--keep-script') '--year'
+        Test-RejectedOptionValue 'pwsh' $caseName @('-ProjectName', 'Acme.RequiredValues', '-Year', $invalidYear, '-KeepScript') '-Year'
+    }
+}
+
+function Test-KeepScriptAfterValueOption {
+    $projectName = 'Acme.RequiredValues'
+    $author = 'Required Value Author'
+    $pwshRoot = Join-Path $tempRoot 'required-value-keep-script-pwsh'
+    $bashRoot = Join-Path $tempRoot 'required-value-keep-script-bash'
+    Copy-Template $pwshRoot
+    Copy-Template $bashRoot
+
+    $null = Invoke-Native 'pwsh' @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', $projectName,
+        '-Author', $author,
+        '-KeepScript'
+    ) $pwshRoot
+    $null = Invoke-Native 'bash' @(
+        './scripts/init.sh',
+        '--project-name', $projectName,
+        '--author', $author,
+        '--keep-script'
+    ) $bashRoot
+
+    Assert-TreesEqual $pwshRoot $bashRoot
+    foreach ($root in @($pwshRoot, $bashRoot)) {
+        Assert-True (Test-Path -LiteralPath (Join-Path $root 'scripts/init.ps1')) 'KeepScript did not preserve init.ps1 after a value option.'
+        Assert-True (Test-Path -LiteralPath (Join-Path $root 'scripts/init.sh')) 'KeepScript did not preserve init.sh after a value option.'
+    }
+}
+
 function Test-RejectedProjectName(
     [string]$initializer,
     [string]$caseName,
@@ -1258,6 +1340,8 @@ try {
     Test-RejectedInput 'bash' 'newline'
     Test-RejectedInput 'pwsh' 'owner'
     Test-RejectedInput 'bash' 'owner'
+    Test-RequiredOptionValues
+    Test-KeepScriptAfterValueOption
     $invalidProjectNames = @(
         @{
             Case = 'con'

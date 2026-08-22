@@ -84,7 +84,10 @@ assumptions a past agent got wrong:
    basename (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, or `LPT1`-`LPT9`), even
    when it is followed by an extension. Author, author email, and description
    must be single-line; GitHub owner must be 1-39 letters, digits, or hyphens with
-   no leading or trailing hyphen. Quotes,
+   no leading or trailing hyphen. Every supplied metadata option or parameter
+   must be followed by its value; the end of the command or a following option
+   is rejected before mutation. Bash `--year` accepts a signed decimal value in
+   the PowerShell `Int32` range. Quotes,
    backslashes, shell/Python metacharacters, and placeholder-like text are safe:
    replacement is one pass, XML destinations are escaped, and the workflow
    identity is serialized before Bash receives it. Before any mutation, the

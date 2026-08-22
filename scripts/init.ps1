@@ -42,7 +42,7 @@
     Single-line package description. Defaults to "TODO: project description".
 
 .PARAMETER Year
-    Copyright year. Defaults to the current year.
+    Copyright year as a 32-bit integer. Defaults to the current year.
 
 .PARAMETER KeepScript
     Keep this script after running (TEMPLATE.md is removed either way).
