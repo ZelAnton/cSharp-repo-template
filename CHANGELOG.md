@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All GitHub Actions are pinned to a commit SHA (with a version comment) instead of a moving tag; Dependabot now groups action bumps into a single weekly PR.
 
 ### Fixed
+- Template initialization now distinguishes omitted values from explicit empty values, rejects empty project names and years, and keeps optional metadata fallbacks equivalent across Bash and PowerShell.
+- Bash template initialization now rejects missing option values, following options used as values, option names with incorrect casing, and years outside the signed decimal `Int32` contract before changing files.
 - Template initialization now rejects project names incompatible with generated C# namespaces, portable paths, NuGet package IDs, or Docker volumes before changing the tree.
 - Template initialization now changes only an explicit template-owned inventory, rejects local collisions and symbolic path escapes, preserves external hard-linked peers, and rolls back late I/O failures.
 - Template initialization now rejects a missing or mistyped required inventory source before changing any files.

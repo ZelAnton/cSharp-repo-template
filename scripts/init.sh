@@ -19,9 +19,12 @@
 # NuGet PackageId, path component, and Docker volume prefix. The rest fall back
 # to sensible defaults so the result always builds. Author, author-email, and
 # description must be single-line; GitHub owner must be a valid account-path
-# segment. Edit LICENSE / the .csproj afterwards to refine them.
+# segment. Every supplied option requires a value before another --option, and
+# --year must be a signed decimal Int32. Edit LICENSE / the .csproj afterwards
+# to refine them.
 
 set -Eeuo pipefail
+shopt -u nocasematch
 
 project_name=""
 author=""
@@ -29,18 +32,39 @@ author_email=""
 github_owner=""
 description=""
 year=""
+year_supplied=0
 keep_script=0
 
 die() { echo "error: $*" >&2; exit 1; }
 
+read_option_value() {
+  local option="$1"
+  if [ "$#" -lt 2 ]; then
+    die "$option requires a value. No files were changed."
+  fi
+  case "$2" in
+    -*)
+      if [ "$option" = "--year" ]; then
+        case "${2#-}" in
+          ""|*[!0-9]*) die "$option requires a value before option '$2'. No files were changed." ;;
+          *) ;;
+        esac
+      else
+        die "$option requires a value before option '$2'. No files were changed."
+      fi
+      ;;
+  esac
+  option_value="$2"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --project-name) project_name="${2:-}"; shift 2 ;;
-    --author)       author="${2:-}"; shift 2 ;;
-    --author-email) author_email="${2:-}"; shift 2 ;;
-    --github-owner) github_owner="${2:-}"; shift 2 ;;
-    --description)  description="${2:-}"; shift 2 ;;
-    --year)         year="${2:-}"; shift 2 ;;
+    --project-name) read_option_value "$@"; project_name="$option_value"; shift 2 ;;
+    --author)       read_option_value "$@"; author="$option_value"; shift 2 ;;
+    --author-email) read_option_value "$@"; author_email="$option_value"; shift 2 ;;
+    --github-owner) read_option_value "$@"; github_owner="$option_value"; shift 2 ;;
+    --description)  read_option_value "$@"; description="$option_value"; shift 2 ;;
+    --year)         read_option_value "$@"; year="$option_value"; year_supplied=1; shift 2 ;;
     --keep-script)  keep_script=1; shift ;;
     -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
     *)              die "unknown argument: $1" ;;
@@ -107,6 +131,45 @@ validate_project_name() {
 }
 
 LC_ALL=C validate_project_name "$project_name"
+
+validate_year() {
+  local value="$1"
+  local sign=""
+  local digits limit
+
+  case "$value" in
+    +*) sign="+"; digits="${value#+}" ;;
+    -*) sign="-"; digits="${value#-}" ;;
+    *)  digits="$value" ;;
+  esac
+  case "$digits" in
+    ""|*[!0-9]*)
+      die "invalid --year '$value'. Use a signed decimal 32-bit integer. No files were changed." ;;
+  esac
+
+  while [ "${#digits}" -gt 1 ] && [ "${digits#0}" != "$digits" ]; do
+    digits="${digits#0}"
+  done
+  if [ "$sign" = "-" ]; then
+    limit="2147483648"
+  else
+    limit="2147483647"
+  fi
+  if [ "${#digits}" -gt "${#limit}" ] ||
+    { [ "${#digits}" -eq "${#limit}" ] && [[ "$digits" > "$limit" ]]; }; then
+    die "invalid --year '$value'. Use a signed decimal 32-bit integer. No files were changed."
+  fi
+
+  if [ "$sign" = "-" ] && [ "$digits" != "0" ]; then
+    year="-$digits"
+  else
+    year="$digits"
+  fi
+}
+
+if [ "$year_supplied" -eq 1 ]; then
+  LC_ALL=C validate_year "$year"
+fi
 
 # Defaults (mirror init.ps1).
 if [ -z "$author" ]; then
