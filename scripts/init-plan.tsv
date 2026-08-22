@@ -32,4 +32,5 @@ activate	.claude/settings.json.template	.claude/settings.json
 remove	TEMPLATE.md
 remove	docs/AGENT-INIT-GUIDE.md
 remove	scripts/tests/init-substitution.tests.ps1
+remove	scripts/init-windows-metadata.ps1
 remove	scripts/init-plan.tsv

@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Template initialization now changes only an explicit template-owned inventory, rejects local collisions and symbolic path escapes, preserves external hard-linked peers, and rolls back late I/O failures.
+- Template initialization now rejects a missing or mistyped required inventory source before changing any files.
+- Git Bash initialization on Windows now preserves exact file security metadata across content replacement and rollback.
 - Release versioning now selects the highest exact stable SemVer tag reachable from the pinned source and checks tag existence through unambiguous tag refs.
 - First-release changelog auto-fill now includes release-worthy changes from the repository's root commit.
 - NuGet packages now contain the same versioned changelog state used for release notes and the release tag.

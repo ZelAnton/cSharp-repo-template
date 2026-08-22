@@ -330,6 +330,36 @@ function Test-PreflightCollision([string]$initializer, [string]$collision) {
     Assert-True (Test-Path -LiteralPath (Join-Path $root '.claude/settings.json.template')) "$initializer partially activated settings after the $collision preflight failure."
 }
 
+function Test-MissingPlanSource([string]$initializer, [string]$sourceKind) {
+    $projectName = 'Acme.MissingSource'
+    $root = Join-Path $tempRoot "missing-$initializer-$sourceKind"
+    Copy-Template $root
+    $relativeSource = switch ($sourceKind) {
+        'content' { '.github/CODEOWNERS' }
+        'move' { '__ProjectName__.sln.DotSettings' }
+        'activate' { '.claude/settings.json.template' }
+        default { throw "Unknown missing-source kind: $sourceKind" }
+    }
+    Remove-Item -LiteralPath (Join-Path $root $relativeSource) -Force
+    $before = Get-TreeSnapshot $root
+
+    $result = Invoke-InitializerExpectingFailure $initializer $root $projectName
+    $after = Get-TreeSnapshot $root
+
+    Assert-True ($result.Output -match '(?i)required template .* source is missing') "$initializer did not report the missing $sourceKind source clearly: $($result.Output)"
+    Assert-True ($result.Output -match 'No files were changed') "$initializer did not report the missing $sourceKind preflight as non-mutating."
+    Assert-True ($result.Output -notmatch 'Preflight validated') "$initializer began initialization with a missing $sourceKind source."
+    Assert-True ($result.Output -notmatch '(?i)rollback') "$initializer attempted rollback for a missing-source preflight failure."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the tree after rejecting a missing $sourceKind source."
+    Assert-True (Test-Path -LiteralPath (Join-Path $root 'src/__ProjectName__/__ProjectName__.csproj')) "$initializer partially renamed the project after the missing $sourceKind preflight failure."
+    if ($sourceKind -eq 'activate') {
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $root '.claude/settings.json'))) "$initializer created settings after the missing activation-source preflight failure."
+    }
+    else {
+        Assert-True (Test-Path -LiteralPath (Join-Path $root '.claude/settings.json.template')) "$initializer partially activated settings after the missing $sourceKind preflight failure."
+    }
+}
+
 function Invoke-InitializerExpectingFailure([string]$initializer, [string]$root, [string]$projectName) {
     if ($initializer -eq 'pwsh') {
         return Invoke-Native 'pwsh' @(
@@ -398,7 +428,7 @@ function Test-HardLinkContentIsolation([string]$initializer) {
     [IO.File]::Copy($internalPath, $externalPath)
     Remove-Item -LiteralPath $internalPath -Force
     New-Item -ItemType HardLink -Path $internalPath -Target $externalPath | Out-Null
-    if ($IsWindows -and $initializer -eq 'pwsh') {
+    if ($IsWindows) {
         Protect-FileAccessRules $internalPath
     }
 
@@ -424,9 +454,7 @@ function Test-HardLinkContentIsolation([string]$initializer) {
     $externalAfter = Get-TreeSnapshot $externalRoot
     Assert-True (@(Compare-Object $externalBefore $externalAfter).Count -eq 0) "$initializer changed the external hard-linked target."
     Assert-True ([IO.File]::ReadAllText($internalPath).Contains($projectName)) "$initializer did not update the repository-side hard link."
-    if (-not $IsWindows -or $initializer -eq 'pwsh') {
-        Assert-Equal $internalMetadataBefore (Get-FileMetadataSnapshot $internalPath) "$initializer did not preserve repository file metadata."
-    }
+    Assert-Equal $internalMetadataBefore (Get-FileMetadataSnapshot $internalPath) "$initializer did not preserve repository file metadata."
     [IO.File]::WriteAllText($internalPath, "repository only`n", $utf8NoBom)
     Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer left the repository file linked to the external target."
 }
@@ -617,7 +645,7 @@ function Test-LateFailureRollback([string]$initializer) {
     [IO.File]::Copy($internalHardLink, $externalHardLink)
     Remove-Item -LiteralPath $internalHardLink -Force
     New-Item -ItemType HardLink -Path $internalHardLink -Target $externalHardLink | Out-Null
-    if ($IsWindows -and $initializer -eq 'pwsh') {
+    if ($IsWindows) {
         Protect-FileAccessRules $internalHardLink
     }
     $externalBefore = Get-TreeSnapshot $externalRoot
@@ -688,9 +716,7 @@ exec '$realMove' "`$@"
     $after = Get-TreeSnapshot $root
     Assert-True ($result.Output -match '(?i)(rolled back|rollback)') "$initializer did not report rollback after the late failure."
     Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer did not restore the complete tree after the late failure."
-    if (-not $IsWindows -or $initializer -eq 'pwsh') {
-        Assert-Equal $internalMetadataBefore (Get-FileMetadataSnapshot $internalHardLink) "$initializer rollback did not restore repository file metadata."
-    }
+    Assert-Equal $internalMetadataBefore (Get-FileMetadataSnapshot $internalHardLink) "$initializer rollback did not restore repository file metadata."
     Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer rollback changed the external hard-linked target."
     [IO.File]::WriteAllText($internalHardLink, "repository rollback only`n", $utf8NoBom)
     Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer rollback left the repository file linked to the external target."
@@ -766,15 +792,17 @@ function Assert-GeneratedValues(
 }
 
 function Test-ScriptSyntax([string]$root) {
-    $tokens = $null
-    $errors = $null
-    [Management.Automation.Language.Parser]::ParseFile(
-        (Join-Path $root 'scripts/init.ps1'),
-        [ref]$tokens,
-        [ref]$errors
-    ) | Out-Null
-    if ($errors.Count -gt 0) {
-        throw "PowerShell initializer syntax errors:`n$($errors | Out-String)"
+    foreach ($relativeScript in @('scripts/init.ps1', 'scripts/init-windows-metadata.ps1')) {
+        $tokens = $null
+        $errors = $null
+        [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $root $relativeScript),
+            [ref]$tokens,
+            [ref]$errors
+        ) | Out-Null
+        if ($errors.Count -gt 0) {
+            throw "PowerShell syntax errors in ${relativeScript}:`n$($errors | Out-String)"
+        }
     }
 
     $null = Invoke-Native 'bash' @('-n', './scripts/init.sh') $root
@@ -1101,6 +1129,10 @@ try {
     Test-PreflightCollision 'bash' 'rename'
     Test-PreflightCollision 'pwsh' 'settings'
     Test-PreflightCollision 'bash' 'settings'
+    foreach ($sourceKind in @('content', 'move', 'activate')) {
+        Test-MissingPlanSource 'pwsh' $sourceKind
+        Test-MissingPlanSource 'bash' $sourceKind
+    }
     Test-LinkSafety 'pwsh' 'file'
     Test-LinkSafety 'bash' 'file'
     Test-LinkSafety 'pwsh' 'directory'

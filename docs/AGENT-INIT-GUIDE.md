@@ -82,12 +82,15 @@ assumptions a past agent got wrong:
    backslashes, shell/Python metacharacters, and placeholder-like text are safe:
    replacement is one pass, XML destinations are escaped, and the workflow
    identity is serialized before Bash receives it. Before any mutation, the
-   initializer loads and validates the complete `scripts/init-plan.tsv` plan and
-   rejects every existing destination, including `.claude/settings.json`. It
-   also rejects symlink, junction, and other reparse-point components in planned
-   sources, destinations, and their existing ancestors. Content updates replace
-   the repository entry instead of writing through it, so an external hard-linked
-   peer remains unchanged. If an I/O error still
+   initializer loads and validates the complete `scripts/init-plan.tsv` plan,
+   requires every declared source to exist with its expected file or directory
+   type, and rejects every existing destination, including
+   `.claude/settings.json`. It also rejects symlink, junction, and other
+   reparse-point components in planned sources, destinations, and their existing
+   ancestors. Content updates replace the repository entry instead of writing
+   through it, so an external hard-linked peer remains unchanged; file metadata,
+   including Windows access-control rules under PowerShell and Git Bash, is
+   preserved across replacement and rollback. If an I/O error still
    occurs after preflight, the mutation journal restores the complete original
    tree before the initializer reports failure.
    `content` entries are the exact substitution boundary; no recursive scan is
@@ -277,10 +280,11 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
   existing `.claude/settings.json` after earlier changes had already landed.
 - **Root cause:** Both initializers recursively enumerated the checkout and used a
   forced settings move without a complete collision preflight.
-- **Rule:** Mutate only entries in `scripts/init-plan.tsv`, validate every planned
-  source, destination, and existing ancestor before the first write, roll back
-  unexpected late failures, and keep the cross-shell preservation, link-safety,
-  collision, and rollback cases in `scripts/tests/init-substitution.tests.ps1` green.
+- **Rule:** Mutate only entries in `scripts/init-plan.tsv`, require every current
+  source with its declared type, validate every destination and existing ancestor
+  before the first write, preserve platform metadata exactly, roll back unexpected
+  late failures, and keep the cross-shell preservation, link-safety, collision,
+  and rollback cases in `scripts/tests/init-substitution.tests.ps1` green.
 
 ### 2026-08-21 — Metadata could cascade or enter the release shell as code
 - **Symptom:** Quotes, shell metacharacters, line breaks, or another placeholder

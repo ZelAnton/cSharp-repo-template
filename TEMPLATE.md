@@ -55,11 +55,14 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
      in that plan; it never recursively scans the repository, so unknown files,
      binary data, `.work`, caches, and unknown files inside the original
      token-named source directories remain byte-for-byte at their original paths;
-   - stops before the first mutation if any planned destination already exists,
-     including a generated solution/project path or `.claude/settings.json`, and
-     rejects symlink, junction, or other reparse-point components in every
-     planned source and destination; content updates replace their repository
-     entry so an external hard-linked peer is never written through;
+   - requires every source in the current plan to exist with its declared file or
+     directory type, and stops before the first mutation if any planned
+     destination already exists, including a generated solution/project path or
+     `.claude/settings.json`; it also rejects symlink, junction, or other
+     reparse-point components in every planned source and destination;
+   - replaces content through a new repository entry so an external hard-linked
+     peer is never written through, while preserving file metadata, including
+     Windows access-control rules under PowerShell and Git Bash;
    - restores the complete original tree if an I/O failure still occurs after
      preflight while content, paths, or template-only files are being changed;
    - replaces all placeholder tokens in one pass, so placeholder-like text inside

@@ -156,6 +156,114 @@ resolve_plan_path() {
 path_exists() { [ -e "$1" ] || [ -L "$1" ]; }
 is_link_or_reparse() { [ -L "$1" ] || [ -n "$(readlink "$1" 2>/dev/null || true)" ]; }
 
+windows_acl_mode=0
+windows_path_tool=""
+windows_pwsh_command=""
+windows_metadata_helper="$script_dir/init-windows-metadata.ps1"
+windows_metadata_helper_path=""
+windows_staging_parent=""
+windows_interop_environment="${WSLENV:-}"
+windows_pwsh_launcher='JABFAHIAcgBvAHIAQQBjAHQAaQBvAG4AUAByAGUAZgBlAHIAZQBuAGMAZQAgAD0AIAAiAFMAdABvAHAAIgAKACQAaABlAGwAcABlAHIAIAA9ACAAWwBFAG4AdgBpAHIAbwBuAG0AZQBuAHQAXQA6ADoARwBlAHQARQBuAHYAaQByAG8AbgBtAGUAbgB0AFYAYQByAGkAYQBiAGwAZQAoACIAQwBTAEgAQQBSAFAAXwBUAEUATQBQAEwAQQBUAEUAXwBNAEUAVABBAEQAQQBUAEEAXwBIAEUATABQAEUAUgAiACwAIAAiAFAAcgBvAGMAZQBzAHMAIgApAAoAJABhAGMAdABpAG8AbgAgAD0AIABbAEUAbgB2AGkAcgBvAG4AbQBlAG4AdABdADoAOgBHAGUAdABFAG4AdgBpAHIAbwBuAG0AZQBuAHQAVgBhAHIAaQBhAGIAbABlACgAIgBDAFMASABBAFIAUABfAFQARQBNAFAATABBAFQARQBfAE0ARQBUAEEARABBAFQAQQBfAEEAQwBUAEkATwBOACIALAAgACIAUAByAG8AYwBlAHMAcwAiACkACgAmACAAJABoAGUAbABwAGUAcgAgAC0AQQBjAHQAaQBvAG4AIAAkAGEAYwB0AGkAbwBuAA=='
+case "$(uname -s 2>/dev/null || true)" in
+  MINGW*|MSYS*|CYGWIN*)
+    windows_acl_mode=1
+    command -v pwsh >/dev/null 2>&1 || die "Windows file security metadata cannot be preserved because pwsh is unavailable. No files were changed."
+    command -v cygpath >/dev/null 2>&1 || die "Windows file security metadata cannot be preserved because cygpath is unavailable. No files were changed."
+    windows_path_tool="cygpath"
+    windows_pwsh_command="pwsh"
+    ;;
+  Linux)
+    if [ -r /proc/sys/kernel/osrelease ] && grep -qi microsoft /proc/sys/kernel/osrelease; then
+      command -v wslpath >/dev/null 2>&1 || die "Windows file security metadata cannot be preserved because wslpath is unavailable. No files were changed."
+      case "$(wslpath -w "$repo_root")" in
+        [A-Za-z]:\\*)
+          windows_acl_mode=1
+          command -v pwsh.exe >/dev/null 2>&1 || die "Windows file security metadata cannot be preserved because pwsh.exe is unavailable to WSL. No files were changed."
+          windows_path_tool="wslpath"
+          windows_pwsh_command="pwsh.exe"
+          windows_interop_environment="${windows_interop_environment:+$windows_interop_environment:}CSHARP_TEMPLATE_METADATA_PATH:CSHARP_TEMPLATE_METADATA_HELPER:CSHARP_TEMPLATE_METADATA_ACTION:CSHARP_TEMPLATE_METADATA_B64"
+          ;;
+      esac
+    fi
+    ;;
+esac
+if [ "$windows_acl_mode" -eq 1 ]; then
+  [ -f "$windows_metadata_helper" ] || die "Windows file security metadata helper is missing: scripts/init-windows-metadata.ps1. No files were changed."
+  windows_metadata_helper_path="$("$windows_path_tool" -w "$windows_metadata_helper")" ||
+    die "Windows file security metadata helper path cannot be resolved. No files were changed."
+  windows_staging_parent="$({
+    CSHARP_TEMPLATE_METADATA_HELPER="$windows_metadata_helper_path" \
+      CSHARP_TEMPLATE_METADATA_ACTION='temp' \
+      WSLENV="$windows_interop_environment" \
+      MSYS2_ARG_CONV_EXCL='*' "$windows_pwsh_command" -NoLogo -NoProfile -NonInteractive \
+        -EncodedCommand "$windows_pwsh_launcher"
+  })" || die "Windows temporary path cannot be resolved. No files were changed."
+  windows_staging_parent="$("$windows_path_tool" -u "$windows_staging_parent")" ||
+    die "Windows temporary path cannot be converted. No files were changed."
+  [ -d "$windows_staging_parent" ] || die "Windows temporary path is not a directory. No files were changed."
+fi
+
+declare -a windows_metadata_paths=()
+declare -a windows_metadata_values=()
+
+capture_windows_metadata() {
+  local path="$1"
+  local windows_path
+  local metadata
+  [ "$windows_acl_mode" -eq 1 ] || return 0
+  windows_path="$("$windows_path_tool" -w "$path")" || return 1
+  metadata="$({
+    CSHARP_TEMPLATE_METADATA_PATH="$windows_path" \
+      CSHARP_TEMPLATE_METADATA_HELPER="$windows_metadata_helper_path" \
+      CSHARP_TEMPLATE_METADATA_ACTION='capture' \
+      WSLENV="$windows_interop_environment" \
+      MSYS2_ARG_CONV_EXCL='*' "$windows_pwsh_command" -NoLogo -NoProfile -NonInteractive \
+        -EncodedCommand "$windows_pwsh_launcher"
+  })" || return 1
+  [ -n "$metadata" ] || return 1
+  windows_metadata_value="$metadata"
+}
+
+register_windows_metadata() {
+  local path="$1"
+  local existing
+  [ "$windows_acl_mode" -eq 1 ] || return 0
+  for existing in "${windows_metadata_paths[@]-}"; do
+    [ "$existing" != "$path" ] || return 0
+  done
+  capture_windows_metadata "$path" || die "Windows file security metadata cannot be read: ${path#"$repo_root/"}. No files were changed."
+  windows_metadata_paths[${#windows_metadata_paths[@]}]="$path"
+  windows_metadata_values[${#windows_metadata_values[@]}]="$windows_metadata_value"
+}
+
+lookup_windows_metadata() {
+  local path="$1"
+  local i
+  [ "$windows_acl_mode" -eq 1 ] || return 0
+  for ((i = 0; i < ${#windows_metadata_paths[@]}; i++)); do
+    if [ "${windows_metadata_paths[$i]}" = "$path" ]; then
+      windows_metadata_value="${windows_metadata_values[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+apply_windows_metadata() {
+  local path="$1"
+  local metadata="$2"
+  local windows_path
+  [ "$windows_acl_mode" -eq 1 ] || return 0
+  windows_path="$("$windows_path_tool" -w "$path")" || return 1
+  CSHARP_TEMPLATE_METADATA_PATH="$windows_path" \
+    CSHARP_TEMPLATE_METADATA_B64="$metadata" \
+    CSHARP_TEMPLATE_METADATA_HELPER="$windows_metadata_helper_path" \
+    CSHARP_TEMPLATE_METADATA_ACTION='apply' \
+    WSLENV="$windows_interop_environment" \
+    MSYS2_ARG_CONV_EXCL='*' "$windows_pwsh_command" -NoLogo -NoProfile -NonInteractive \
+      -EncodedCommand "$windows_pwsh_launcher" >/dev/null
+}
+
 assert_no_link_components() {
   local relative="$1"
   local role="$2"
@@ -256,7 +364,7 @@ for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
 
   case "$kind" in
     content)
-      path_exists "$source" || continue
+      path_exists "$source" || die "required template content source is missing: $source_relative. No files were changed."
       [ -f "$source" ] || die "template content path is not a file: $source_relative. No files were changed."
       case "$source" in
         *.csproj|*.props|*.targets|*.slnx|*.config) mode=xml ;;
@@ -267,12 +375,13 @@ for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
       if [ "$transformed" != "$content" ]; then
         [ -w "$source" ] || die "template content path is not writable: $source_relative. No files were changed."
         assert_changeable_parent "$source" "$source_relative" "template content replacement"
+        register_windows_metadata "$source"
         content_paths[${#content_paths[@]}]="$source"
         content_values[${#content_values[@]}]="$transformed"
       fi
       ;;
     directory)
-      path_exists "$source" || continue
+      path_exists "$source" || die "required template directory source is missing: $source_relative. No files were changed."
       [ -d "$source" ] || die "template directory path is not a directory: $source_relative. No files were changed."
       [ "$source" != "$destination" ] || continue
       ! path_exists "$destination" || die "initialization target collision: $destination_relative already exists. No files were changed."
@@ -282,7 +391,7 @@ for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
       directory_targets[${#directory_targets[@]}]="$destination"
       ;;
     move|activate)
-      path_exists "$source" || continue
+      path_exists "$source" || die "required template $kind source is missing: $source_relative. No files were changed."
       [ -f "$source" ] || die "template move source is not a file: $source_relative. No files were changed."
       [ "$source" != "$destination" ] || continue
       ! path_exists "$destination" || die "initialization target collision: $destination_relative already exists. No files were changed."
@@ -297,22 +406,34 @@ for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
       move_targets[${#move_targets[@]}]="$destination"
       ;;
     remove)
-      if path_exists "$source" && [ ! -f "$source" ]; then
+      path_exists "$source" || die "required template removal source is missing: $source_relative. No files were changed."
+      if [ ! -f "$source" ]; then
         die "template-only removal path is not a file: $source_relative. No files were changed."
       fi
-      if path_exists "$source"; then
-        [ -w "$source" ] || die "template-only removal path is not writable: $source_relative. No files were changed."
-        assert_changeable_parent "$source" "$source_relative" "template-only removal"
-      fi
+      [ -w "$source" ] || die "template-only removal path is not writable: $source_relative. No files were changed."
+      assert_changeable_parent "$source" "$source_relative" "template-only removal"
+      register_windows_metadata "$source"
       remove_paths[${#remove_paths[@]}]="$source"
       ;;
   esac
 done
 
+if [ "$keep_script" -ne 1 ]; then
+  for path in "$sibling_ps1" "$self"; do
+    if [ -f "$path" ]; then
+      register_windows_metadata "$path"
+    fi
+  done
+fi
+
 echo "==> Initializing template as '$project_name'"
 echo "    Preflight validated ${#plan_kinds[@]} template-owned operation(s)."
 
-staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/csharp-template-init.XXXXXXXX")"
+staging_parent="${TMPDIR:-/tmp}"
+if [ "$windows_acl_mode" -eq 1 ]; then
+  staging_parent="$windows_staging_parent"
+fi
+staging_dir="$(mktemp -d "$staging_parent/csharp-template-init.XXXXXXXX")"
 declare -a backup_originals=()
 declare -a backup_copies=()
 declare -a mutated_backup_originals=()
@@ -357,6 +478,12 @@ rollback_transaction() {
 }
 
 trap rollback_transaction ERR INT TERM
+
+if [ "$windows_acl_mode" -eq 1 ]; then
+  staged_windows_metadata_helper="$staging_dir/init-windows-metadata.ps1"
+  cp -- "$windows_metadata_helper" "$staged_windows_metadata_helper"
+  windows_metadata_helper_path="$("$windows_path_tool" -w "$staged_windows_metadata_helper")"
+fi
 
 backup_file() {
   local original="$1"
@@ -405,6 +532,10 @@ replace_file_content() {
     return 1
   fi
   journal_backup "$original"
+  if [ "$windows_acl_mode" -eq 1 ]; then
+    lookup_windows_metadata "$original" || return 1
+    apply_windows_metadata "$original" "$windows_metadata_value" || return 1
+  fi
 }
 
 restore_file() {
@@ -420,6 +551,10 @@ restore_file() {
   if ! mv -f -- "$temporary" "$original"; then
     rm -f -- "$temporary"
     return 1
+  fi
+  if [ "$windows_acl_mode" -eq 1 ]; then
+    lookup_windows_metadata "$original" || return 1
+    apply_windows_metadata "$original" "$windows_metadata_value" || return 1
   fi
 }
 

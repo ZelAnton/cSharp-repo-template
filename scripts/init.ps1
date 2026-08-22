@@ -655,7 +655,7 @@ foreach ($operation in $plan) {
     switch ($operation.Kind) {
         'content' {
             if (-not $sourceExists) {
-                continue
+                throw "Required template content source is missing: $($operation.Source.Relative). No files were changed."
             }
             if (-not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf)) {
                 throw "Template content path is not a file: $($operation.Source.Relative). No files were changed."
@@ -675,7 +675,7 @@ foreach ($operation in $plan) {
         }
         'directory' {
             if (-not $sourceExists) {
-                continue
+                throw "Required template directory source is missing: $($operation.Source.Relative). No files were changed."
             }
             if (-not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Container)) {
                 throw "Template directory path is not a directory: $($operation.Source.Relative). No files were changed."
@@ -694,7 +694,7 @@ foreach ($operation in $plan) {
         }
         { $_ -in @('move', 'activate') } {
             if (-not $sourceExists) {
-                continue
+                throw "Required template $($operation.Kind) source is missing: $($operation.Source.Relative). No files were changed."
             }
             if (-not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf)) {
                 throw "Template move source is not a file: $($operation.Source.Relative). No files were changed."
@@ -718,13 +718,14 @@ foreach ($operation in $plan) {
             $plannedDestinations[$operation.Destination.FullPath] = $operation.Source.Relative
         }
         'remove' {
-            if ($sourceExists -and -not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf)) {
+            if (-not $sourceExists) {
+                throw "Required template removal source is missing: $($operation.Source.Relative). No files were changed."
+            }
+            if (-not (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf)) {
                 throw "Template-only removal path is not a file: $($operation.Source.Relative). No files were changed."
             }
-            if ($sourceExists) {
-                Assert-FileCanBeChanged $operation.Source 'Template-only removal'
-                Assert-DirectoryCanBeChanged (Split-Path -Parent $operation.Source.FullPath) $operation.Source.Relative 'Template-only removal'
-            }
+            Assert-FileCanBeChanged $operation.Source 'Template-only removal'
+            Assert-DirectoryCanBeChanged (Split-Path -Parent $operation.Source.FullPath) $operation.Source.Relative 'Template-only removal'
         }
     }
 }
