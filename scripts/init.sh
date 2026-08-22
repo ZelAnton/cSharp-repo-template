@@ -100,8 +100,8 @@ validate_project_name() {
   done
 
   windows_base_name="${value%%.*}"
-  case "${windows_base_name^^}" in
-    CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])
+  case "$windows_base_name" in
+    [Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][123456789]|[Ll][Pp][Tt][123456789])
       die "Invalid ProjectName '$value': Windows reserves the base name '$windows_base_name' (case-insensitive), including when followed by an extension. No files were changed." ;;
   esac
 }

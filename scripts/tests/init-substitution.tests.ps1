@@ -850,6 +850,11 @@ function Test-ScriptSyntax([string]$root) {
     $null = Invoke-Native 'bash' @('-n', './scripts/init.sh') $root
 }
 
+function Test-Bash32Compatibility([string]$root) {
+    $script = [IO.File]::ReadAllText((Join-Path $root 'scripts/init.sh'))
+    Assert-True ($script -notmatch '\$\{[^}\r\n]*(?:\^\^|,,)[^}\r\n]*\}') 'Bash initializer uses Bash 4 case-modifying parameter expansion.'
+}
+
 function Test-GeneratedSyntax([string]$root) {
     $yamlLint = Get-Command yamllint -ErrorAction SilentlyContinue
     if ($yamlLint) {
@@ -1227,6 +1232,7 @@ try {
     Add-LocalData $bashRoot
 
     Test-ScriptSyntax $pwshRoot
+    Test-Bash32Compatibility $pwshRoot
     Test-PowerShellGitFallbacks
     $null = Invoke-Native 'pwsh' @(
         '-NoProfile',
