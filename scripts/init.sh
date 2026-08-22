@@ -54,8 +54,17 @@ done
 # expressions byte-oriented even when the caller disabled globasciiranges.
 validate_project_name() {
   local value="$1"
-  local seg windows_base_name
+  local seg keyword windows_base_name
   local -a segments=()
+  local -a csharp_keywords=(
+    abstract as base bool break byte case catch char checked class const continue
+    decimal default delegate do double else enum event explicit extern false finally
+    fixed float for foreach goto if implicit in int interface internal is lock long
+    namespace new null object operator out override params private protected public
+    readonly ref return sbyte sealed short sizeof stackalloc static string struct switch
+    this throw true try typeof uint ulong unchecked unsafe ushort using virtual void
+    volatile while
+  )
 
   case "$value" in
     *$'\r'*|*$'\n'*)
@@ -82,11 +91,12 @@ validate_project_name() {
     *) die "Invalid ProjectName '$value': the first character must be an ASCII letter because Docker volume names must start with an alphanumeric character. No files were changed." ;;
   esac
 
-  local csharp_keywords='|abstract|as|base|bool|break|byte|case|catch|char|checked|class|const|continue|decimal|default|delegate|do|double|else|enum|event|explicit|extern|false|finally|fixed|float|for|foreach|goto|if|implicit|in|int|interface|internal|is|lock|long|namespace|new|null|object|operator|out|override|params|private|protected|public|readonly|ref|return|sbyte|sealed|short|sizeof|stackalloc|static|string|struct|switch|this|throw|true|try|typeof|uint|ulong|unchecked|unsafe|ushort|using|virtual|void|volatile|while|'
   for seg in "${segments[@]}"; do
-    case "$csharp_keywords" in
-      *"|$seg|"*) die "Invalid ProjectName '$value': segment '$seg' is a reserved C# keyword and cannot be used as a namespace identifier. No files were changed." ;;
-    esac
+    for keyword in "${csharp_keywords[@]}"; do
+      if [ "$seg" = "$keyword" ]; then
+        die "Invalid ProjectName '$value': segment '$seg' is a reserved C# keyword and cannot be used as a namespace identifier. No files were changed."
+      fi
+    done
   done
 
   windows_base_name="${value%%.*}"

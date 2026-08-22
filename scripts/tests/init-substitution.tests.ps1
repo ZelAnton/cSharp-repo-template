@@ -163,7 +163,8 @@ function Invoke-BashInitializer(
     [switch]$ExpectFailure,
     [string]$PathPrefix,
     [hashtable]$Environment,
-    [switch]$DisableGlobAsciiRanges
+    [switch]$DisableGlobAsciiRanges,
+    [switch]$ExportInheritedBashOptions
 ) {
     $encodedValues = @(
         $projectName,
@@ -208,10 +209,21 @@ $bashCommand \
 "@
     [IO.File]::WriteAllText($runnerFile, $command.Replace("`r`n", "`n"), $utf8NoBom)
     try {
-        if ($Environment) {
-            return Invoke-WithEnvironment 'bash' @('./.init-test-runner.sh') $workingDirectory $Environment -ExpectFailure:$ExpectFailure
+        $runnerArguments = if ($ExportInheritedBashOptions) {
+            @(
+                '-u',
+                '-O', 'extglob',
+                '-O', 'nocasematch',
+                '-c', 'export BASHOPTS; exec ./.init-test-runner.sh'
+            )
         }
-        return Invoke-Native 'bash' @('./.init-test-runner.sh') $workingDirectory -ExpectFailure:$ExpectFailure
+        else {
+            @('./.init-test-runner.sh')
+        }
+        if ($Environment) {
+            return Invoke-WithEnvironment 'bash' $runnerArguments $workingDirectory $Environment -ExpectFailure:$ExpectFailure
+        }
+        return Invoke-Native 'bash' $runnerArguments $workingDirectory -ExpectFailure:$ExpectFailure
     }
     finally {
         Remove-Item -LiteralPath $runnerFile -Force -ErrorAction SilentlyContinue
@@ -977,6 +989,39 @@ function Test-BashAsciiValidationLocaleIndependent {
     Assert-True (@(Compare-Object $before $after).Count -eq 0) 'Bash changed the tree after rejecting a locale-sensitive non-ASCII ProjectName.'
 }
 
+function Test-BashKeywordValidationIgnoresInheritedOptions {
+    $projectName = 'Acme.Class'
+    $author = 'Option Inheritance Author'
+    $authorEmail = 'options@example.invalid'
+    $githubOwner = 'safe-owner'
+    $description = 'Inherited Bash option regression'
+    $year = '2042'
+    $pwshRoot = Join-Path $tempRoot 'inherited-bash-options-pwsh'
+    $bashRoot = Join-Path $tempRoot 'inherited-bash-options-bash'
+    Copy-Template $pwshRoot
+    Copy-Template $bashRoot
+    Add-LocalData $pwshRoot
+    Add-LocalData $bashRoot
+
+    $null = Invoke-Native 'pwsh' @(
+        '-NoProfile',
+        '-File', './scripts/init.ps1',
+        '-ProjectName', $projectName,
+        '-Author', $author,
+        '-AuthorEmail', $authorEmail,
+        '-GitHubOwner', $githubOwner,
+        '-Description', $description,
+        '-Year', $year,
+        '-KeepScript'
+    ) $pwshRoot
+    $null = Invoke-BashInitializer $bashRoot $projectName $author $authorEmail $githubOwner $description $year -ExportInheritedBashOptions
+
+    Assert-TreesEqual $pwshRoot $bashRoot
+    Assert-LocalDataPreserved $pwshRoot $projectName
+    Assert-LocalDataPreserved $bashRoot $projectName
+    Assert-True (Test-Path -LiteralPath (Join-Path $bashRoot "src/$projectName/$projectName.csproj")) 'Bash did not generate the valid mixed-case project name.'
+}
+
 function Test-NumericLookingBase64 {
     $projectName = 'Acme.NumericBase64'
     $author = 'Ӎ4'
@@ -1264,6 +1309,7 @@ try {
         Test-RejectedProjectName 'bash' $invalidProjectName.Case $invalidProjectName.Name $invalidProjectName.Message
     }
     Test-BashAsciiValidationLocaleIndependent
+    Test-BashKeywordValidationIgnoresInheritedOptions
     Test-PreflightCollision 'pwsh' 'rename'
     Test-PreflightCollision 'bash' 'rename'
     Test-PreflightCollision 'pwsh' 'settings'
