@@ -161,7 +161,9 @@ function Invoke-BashInitializer(
     [string]$description,
     [string]$year,
     [switch]$ExpectFailure,
-    [string]$PathPrefix
+    [string]$PathPrefix,
+    [hashtable]$Environment,
+    [switch]$DisableGlobAsciiRanges
 ) {
     $encodedValues = @(
         $projectName,
@@ -173,19 +175,42 @@ function Invoke-BashInitializer(
     ) | ForEach-Object { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_)) }
     $runnerFile = Join-Path $workingDirectory '.init-test-runner.sh'
     $pathSetup = if ($PathPrefix) { "export PATH='$PathPrefix':`$PATH`n" } else { '' }
+    $bashCommand = if ($DisableGlobAsciiRanges) {
+        'exec bash +O globasciiranges ./scripts/init.sh'
+    }
+    else {
+        'exec ./scripts/init.sh'
+    }
     $command = @"
 #!/usr/bin/env bash
-$pathSetup`nexec ./scripts/init.sh \
-  --project-name "`$(printf '%s' '$($encodedValues[0])' | base64 --decode)" \
-  --author "`$(printf '%s' '$($encodedValues[1])' | base64 --decode)" \
-  --author-email "`$(printf '%s' '$($encodedValues[2])' | base64 --decode)" \
-  --github-owner "`$(printf '%s' '$($encodedValues[3])' | base64 --decode)" \
-  --description "`$(printf '%s' '$($encodedValues[4])' | base64 --decode)" \
-  --year "`$(printf '%s' '$($encodedValues[5])' | base64 --decode)" \
+$pathSetup
+decode_value() {
+  local encoded="`$1" variable="`$2" decoded
+  decoded="`$(printf '%s' "`$encoded" | base64 --decode; printf x)"
+  printf -v "`$variable" '%s' "`${decoded%x}"
+}
+
+decode_value '$($encodedValues[0])' project_name
+decode_value '$($encodedValues[1])' author
+decode_value '$($encodedValues[2])' author_email
+decode_value '$($encodedValues[3])' github_owner
+decode_value '$($encodedValues[4])' description
+decode_value '$($encodedValues[5])' year
+
+$bashCommand \
+  --project-name "`$project_name" \
+  --author "`$author" \
+  --author-email "`$author_email" \
+  --github-owner "`$github_owner" \
+  --description "`$description" \
+  --year "`$year" \
   --keep-script
 "@
     [IO.File]::WriteAllText($runnerFile, $command.Replace("`r`n", "`n"), $utf8NoBom)
     try {
+        if ($Environment) {
+            return Invoke-WithEnvironment 'bash' @('./.init-test-runner.sh') $workingDirectory $Environment -ExpectFailure:$ExpectFailure
+        }
         return Invoke-Native 'bash' @('./.init-test-runner.sh') $workingDirectory -ExpectFailure:$ExpectFailure
     }
     finally {
@@ -922,6 +947,36 @@ function Test-RejectedProjectName(
     Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the tree after rejecting ProjectName '$projectName'."
 }
 
+function Test-BashAsciiValidationLocaleIndependent {
+    $projectName = 'Éclair'
+    $root = Join-Path $tempRoot 'reject-project-name-bash-non-ascii-locale'
+    Copy-Template $root
+    Add-LocalData $root
+    $before = Get-TreeSnapshot $root
+
+    $initializerArguments = @{
+        workingDirectory = $root
+        projectName = $projectName
+        author = 'Safety Author'
+        authorEmail = 'safety@example.invalid'
+        githubOwner = 'safe-owner'
+        description = 'Locale-independent validation regression'
+        year = '2042'
+        ExpectFailure = $true
+        Environment = @{ LC_ALL = 'en_US.utf8'; LANG = 'en_US.utf8' }
+        DisableGlobAsciiRanges = $true
+    }
+    $result = Invoke-BashInitializer @initializerArguments
+    $after = Get-TreeSnapshot $root
+    $normalizedOutput = [regex]::Replace($result.Output, '(?m)^[ \t]*\|[ \t]?', '')
+    $normalizedOutput = [regex]::Replace($normalizedOutput, '\s+', ' ')
+
+    Assert-True ($normalizedOutput -match 'Invalid ProjectName.*ASCII letters.*No files were changed\.') "Bash did not enforce the ASCII ProjectName rule under a non-C locale with globasciiranges disabled: $($result.Output)"
+    Assert-True ($result.Output -notmatch 'Preflight validated') 'Bash entered the mutation phase after accepting a locale-sensitive non-ASCII ProjectName.'
+    Assert-True ($result.Output -notmatch '(?i)rollback') 'Bash attempted rollback after rejecting the locale-sensitive ProjectName before mutation.'
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) 'Bash changed the tree after rejecting a locale-sensitive non-ASCII ProjectName.'
+}
+
 function Test-NumericLookingBase64 {
     $projectName = 'Acme.NumericBase64'
     $author = 'Ӎ4'
@@ -1192,12 +1247,23 @@ try {
             Case = 'csharp-shape'
             Name = 'Acme-Bad'
             Message = "Invalid ProjectName 'Acme-Bad': use dot-separated C# identifier segments made from ASCII letters, digits, and underscores; each segment must start with a letter or underscore. No files were changed."
+        },
+        @{
+            Case = 'trailing-lf'
+            Name = "Acme`n"
+            Message = 'Invalid ProjectName: line breaks are not allowed because project names must be portable path, NuGet PackageId, and Docker volume components. No files were changed.'
+        },
+        @{
+            Case = 'trailing-crlf'
+            Name = "Acme`r`n"
+            Message = 'Invalid ProjectName: line breaks are not allowed because project names must be portable path, NuGet PackageId, and Docker volume components. No files were changed.'
         }
     )
     foreach ($invalidProjectName in $invalidProjectNames) {
         Test-RejectedProjectName 'pwsh' $invalidProjectName.Case $invalidProjectName.Name $invalidProjectName.Message
         Test-RejectedProjectName 'bash' $invalidProjectName.Case $invalidProjectName.Name $invalidProjectName.Message
     }
+    Test-BashAsciiValidationLocaleIndependent
     Test-PreflightCollision 'pwsh' 'rename'
     Test-PreflightCollision 'bash' 'rename'
     Test-PreflightCollision 'pwsh' 'settings'

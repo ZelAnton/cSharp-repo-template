@@ -64,7 +64,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-if ($ProjectName -notmatch '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$') {
+if ($ProjectName.Contains("`r") -or $ProjectName.Contains("`n")) {
+    throw 'Invalid ProjectName: line breaks are not allowed because project names must be portable path, NuGet PackageId, and Docker volume components. No files were changed.'
+}
+if ($ProjectName -notmatch '\A[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\z') {
     throw "Invalid ProjectName '$ProjectName': use dot-separated C# identifier segments made from ASCII letters, digits, and underscores; each segment must start with a letter or underscore. No files were changed."
 }
 if ($ProjectName.Length -gt 100) {
