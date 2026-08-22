@@ -15,7 +15,12 @@ $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $python = (Get-Command python3 -CommandType Application -ErrorAction SilentlyContinue) ?? `
     (Get-Command python -CommandType Application -ErrorAction Stop)
 $bashPath = if ([OperatingSystem]::IsWindows()) {
-    $git = Get-Command git -CommandType Application -ErrorAction Stop
+    $git = @(Get-Command git -CommandType Application -ErrorAction Stop | Where-Object {
+        Test-Path -LiteralPath (Join-Path (Split-Path $_.Source -Parent) '../bin/bash.exe')
+    })[0]
+    if ($null -eq $git) {
+        throw 'Could not find Git Bash beside an available git executable.'
+    }
     $gitBashPath = [IO.Path]::GetFullPath((Join-Path (Split-Path $git.Source -Parent) '../bin/bash.exe'))
     (Get-Item -LiteralPath $gitBashPath -ErrorAction Stop).FullName
 }
@@ -369,7 +374,8 @@ function Invoke-ReleaseStateCase(
     [string]$name,
     [string]$version,
     [string]$tag,
-    [string]$previousTag
+    [string]$previousTag,
+    [bool]$firstRelease
 ) {
     $caseRoot = Join-Path $tempRoot $name
     [IO.Directory]::CreateDirectory($caseRoot) | Out-Null
@@ -396,12 +402,18 @@ function Invoke-ReleaseStateCase(
         -WorkingDirectory $caseRoot `
         -ScriptName 'promote.py' `
         -Script $promoteScript `
-        -Environment @{ VERSION = $version; TAG = $tag; PREV_TAG = $previousTag })
+        -Environment @{ VERSION = $version; TAG = $tag; FIRST_RELEASE = $firstRelease.ToString().ToLowerInvariant(); PREV_TAG = $previousTag })
 
     $releaseState = [IO.File]::ReadAllText($changelogPath).Replace("`r`n", "`n")
     Assert-True $releaseState.Contains("## [$version] - ") "$name did not create the versioned release section."
     Assert-True $releaseState.Contains("[Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/compare/$tag...HEAD") "$name did not advance the Unreleased comparison link."
-    Assert-True $releaseState.Contains("[$version]: https://github.com/__GitHubOwner__/__ProjectName__/compare/$previousTag...$tag") "$name did not create the release comparison link."
+    if ($firstRelease) {
+        Assert-False $releaseState.Contains('compare/v0.0.0...') "$name created a synthetic v0.0.0 comparison link."
+        Assert-True $releaseState.Contains("[$version]: https://github.com/__GitHubOwner__/__ProjectName__/releases/tag/$tag") "$name did not link the first release to its release tag."
+    }
+    else {
+        Assert-True $releaseState.Contains("[$version]: https://github.com/__GitHubOwner__/__ProjectName__/compare/$previousTag...$tag") "$name did not create the release comparison link."
+    }
 
     [void](Invoke-PythonBlock `
         -WorkingDirectory $caseRoot `
@@ -549,6 +561,10 @@ try {
     }
 
     Assert-Equal 1 ([regex]::Matches($workflow, '(?m)^      - name: Promote Unreleased section in CHANGELOG\.md$').Count) 'The workflow must promote the changelog exactly once.'
+    Assert-True $workflow.Contains('FIRST_RELEASE: ${{ steps.version.outputs.first_release }}') 'Changelog promotion no longer receives first-release mode.'
+    Assert-True $workflow.Contains('PREV_TAG: ${{ steps.version.outputs.previous_tag }}') 'Changelog promotion no longer receives the factual previous release tag.'
+    Assert-True $workflow.Contains('version_link = f"[{version}]: {repo}/releases/tag/{tag}"') 'First-release changelog entries no longer link to their release tag.'
+    Assert-True $workflow.Contains('version_link = f"[{version}]: {repo}/compare/{prev_tag}...{tag}"') 'Subsequent changelog entries no longer compare factual release tags.'
     Assert-True $workflow.Contains('ref: ${{ steps.release_source.outputs.sha }}') 'Checkout no longer uses the immutable dispatch source SHA.'
     Assert-True $workflow.Contains('SOURCE_SHA: ${{ steps.release_source.outputs.sha }}') 'Release steps no longer consume the captured source SHA.'
     Assert-True $workflow.Contains('dotnet pack src/__ProjectName__/__ProjectName__.csproj --no-build --configuration Release --output ./artifacts /p:Version=${{ steps.version.outputs.version }}') 'Pack no longer uses the computed release version.'
@@ -959,12 +975,14 @@ subprocess.run = cancelled_after_attempt
         -Name 'first-release' `
         -Version '0.1.0' `
         -Tag 'v0.1.0' `
-        -PreviousTag 'v0.0.0'
+        -PreviousTag '' `
+        -FirstRelease $true
     $subsequentRelease = Invoke-ReleaseStateCase `
         -Name 'subsequent-release' `
         -Version '1.2.4' `
         -Tag 'v1.2.4' `
-        -PreviousTag 'v1.2.3'
+        -PreviousTag 'v1.2.3' `
+        -FirstRelease $false
     Test-PackedReleaseState $subsequentRelease '1.2.4' 'v1.2.4'
 
     $missingCase = Join-Path $tempRoot 'missing-release-section'
