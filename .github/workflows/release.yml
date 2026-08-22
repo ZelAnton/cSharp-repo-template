@@ -283,7 +283,8 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
-          PREV_TAG: v${{ steps.version.outputs.current }}
+          FIRST_RELEASE: ${{ steps.version.outputs.first_release }}
+          PREV_TAG: ${{ steps.version.outputs.previous_tag }}
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -295,7 +296,8 @@ jobs:
 
           version = os.environ["VERSION"]
           tag = os.environ["TAG"]
-          prev_tag = os.environ["PREV_TAG"]
+          first_release = os.environ["FIRST_RELEASE"] == "true"
+          prev_tag = os.environ.get("PREV_TAG", "")
           date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
           repo = "https://github.com/__GitHubOwner__/__ProjectName__"
 
@@ -314,10 +316,15 @@ jobs:
               print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
               sys.exit(1)
 
-          link_replacement = (
-              f"[Unreleased]: {repo}/compare/{tag}...HEAD\n"
-              f"[{version}]: {repo}/compare/{prev_tag}...{tag}"
-          )
+          if first_release:
+              version_link = f"[{version}]: {repo}/releases/tag/{tag}"
+          else:
+              if not prev_tag:
+                  print("::error::Previous release tag is missing for a subsequent release.", file=sys.stderr)
+                  sys.exit(1)
+              version_link = f"[{version}]: {repo}/compare/{prev_tag}...{tag}"
+
+          link_replacement = f"[Unreleased]: {repo}/compare/{tag}...HEAD\n{version_link}"
           text, n = re.subn(r"^\[Unreleased\]:.*$", link_replacement, text, count=1, flags=re.M)
           if n != 1:
               print("::error::Could not find '[Unreleased]: ...' reference link in CHANGELOG.md", file=sys.stderr)
