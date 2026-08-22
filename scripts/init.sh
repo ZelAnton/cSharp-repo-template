@@ -24,6 +24,7 @@
 # to refine them.
 
 set -Eeuo pipefail
+shopt -u nocasematch
 
 project_name=""
 author=""
@@ -31,13 +32,14 @@ author_email=""
 github_owner=""
 description=""
 year=""
+year_supplied=0
 keep_script=0
 
 die() { echo "error: $*" >&2; exit 1; }
 
 read_option_value() {
   local option="$1"
-  if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+  if [ "$#" -lt 2 ]; then
     die "$option requires a value. No files were changed."
   fi
   case "$2" in
@@ -53,7 +55,7 @@ while [ $# -gt 0 ]; do
     --author-email) read_option_value "$@"; author_email="$option_value"; shift 2 ;;
     --github-owner) read_option_value "$@"; github_owner="$option_value"; shift 2 ;;
     --description)  read_option_value "$@"; description="$option_value"; shift 2 ;;
-    --year)         read_option_value "$@"; year="$option_value"; shift 2 ;;
+    --year)         read_option_value "$@"; year="$option_value"; year_supplied=1; shift 2 ;;
     --keep-script)  keep_script=1; shift ;;
     -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
     *)              die "unknown argument: $1" ;;
@@ -156,7 +158,7 @@ validate_year() {
   fi
 }
 
-if [ -n "$year" ]; then
+if [ "$year_supplied" -eq 1 ]; then
   LC_ALL=C validate_year "$year"
 fi
 

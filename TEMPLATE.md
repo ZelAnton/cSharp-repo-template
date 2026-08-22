@@ -46,10 +46,12 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    back to sensible defaults (`git config user.name`, `git config user.email`,
    `your-org`, a TODO description, the current year). If Git is unavailable or
    either configured identity value is empty, the PowerShell initializer uses
-   `Your Name` and `you@example.com` instead. Every supplied metadata option must
-   be followed by its value: the end of the command or another option is rejected
-   before any file changes, rather than consuming that option as data. Bash
-   `--year` accepts a signed decimal value in the PowerShell `Int32` range. The script:
+   `Your Name` and `you@example.com` instead. An explicit empty optional metadata
+   value uses the same fallback in both initializers. Every supplied metadata
+   option must have a separate argument: the end of the command or another option
+   is rejected before any file changes, rather than consuming that option as data.
+   Empty project names and years are rejected. Both initializers accept a signed
+   decimal year in the `Int32` range. The script:
    - validates all metadata and the complete `scripts/init-plan.tsv` mutation
      plan before writing: `ProjectName` must be 1-100 ASCII characters in
      dot-separated C# identifier segments, must begin with a letter so the

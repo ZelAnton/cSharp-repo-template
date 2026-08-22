@@ -58,11 +58,22 @@ param(
     [string]$AuthorEmail,
     [string]$GitHubOwner,
     [string]$Description,
-    [int]$Year = (Get-Date).Year,
+    [string]$Year = "$(Get-Date -Format yyyy)",
     [switch]$KeepScript
 )
 
 $ErrorActionPreference = 'Stop'
+
+$parsedYear = 0
+if (-not [int]::TryParse(
+    $Year,
+    [Globalization.NumberStyles]::AllowLeadingSign,
+    [Globalization.CultureInfo]::InvariantCulture,
+    [ref]$parsedYear
+)) {
+    throw "Invalid -Year '$Year'. Use a signed decimal 32-bit integer. No files were changed."
+}
+$Year = "$parsedYear"
 
 if ($ProjectName.Contains("`r") -or $ProjectName.Contains("`n")) {
     throw 'Invalid ProjectName: line breaks are not allowed because project names must be portable path, NuGet PackageId, and Docker volume components. No files were changed.'

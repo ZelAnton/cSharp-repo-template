@@ -993,6 +993,57 @@ function Test-RequiredOptionValues {
         Test-RejectedOptionValue 'bash' $caseName @('--project-name', 'Acme.RequiredValues', '--year', $invalidYear, '--keep-script') '--year'
         Test-RejectedOptionValue 'pwsh' $caseName @('-ProjectName', 'Acme.RequiredValues', '-Year', $invalidYear, '-KeepScript') '-Year'
     }
+
+    Test-RejectedOptionValue 'bash' 'project-name-empty' @('--project-name', '') '--project-name'
+    Test-RejectedOptionValue 'pwsh' 'project-name-empty' @('-ProjectName', '') '-ProjectName'
+    Test-RejectedOptionValue 'bash' 'year-empty' @('--project-name', 'Acme.RequiredValues', '--year', '', '--keep-script') '--year'
+    Test-RejectedOptionValue 'pwsh' 'year-empty' @('-ProjectName', 'Acme.RequiredValues', '-Year', '', '-KeepScript') '-Year'
+}
+
+function Test-OptionalEmptyValuesUseFallbacks {
+    $optionCases = @(
+        @{ Case = 'author'; Bash = '--author'; PowerShell = '-Author' },
+        @{ Case = 'author-email'; Bash = '--author-email'; PowerShell = '-AuthorEmail' },
+        @{ Case = 'github-owner'; Bash = '--github-owner'; PowerShell = '-GitHubOwner' },
+        @{ Case = 'description'; Bash = '--description'; PowerShell = '-Description' }
+    )
+
+    foreach ($optionCase in $optionCases) {
+        $projectName = "Acme.Empty$($optionCase.Case.Replace('-', ''))"
+        $pwshRoot = Join-Path $tempRoot "empty-value-pwsh-$($optionCase.Case)"
+        $bashRoot = Join-Path $tempRoot "empty-value-bash-$($optionCase.Case)"
+        Copy-Template $pwshRoot
+        Copy-Template $bashRoot
+        $pwshArguments = @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $projectName,
+            '-Author', 'Explicit Author',
+            '-AuthorEmail', 'explicit@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Explicit description',
+            '-Year', '2042',
+            '-KeepScript'
+        )
+        $bashArguments = @(
+            './scripts/init.sh',
+            '--project-name', $projectName,
+            '--author', 'Explicit Author',
+            '--author-email', 'explicit@example.invalid',
+            '--github-owner', 'safe-owner',
+            '--description', 'Explicit description',
+            '--year', '2042',
+            '--keep-script'
+        )
+        $pwshArguments[[Array]::IndexOf($pwshArguments, $optionCase.PowerShell) + 1] = ''
+        $bashArguments[[Array]::IndexOf($bashArguments, $optionCase.Bash) + 1] = ''
+
+        $null = Invoke-Native 'pwsh' $pwshArguments $pwshRoot
+        $null = Invoke-Native 'bash' $bashArguments $bashRoot
+
+        Assert-TreesEqual $pwshRoot $bashRoot
+        Assert-True (Test-Path -LiteralPath (Join-Path $bashRoot "src/$projectName/$projectName.csproj")) "Bash did not initialize after an explicit empty $($optionCase.Bash) value."
+    }
 }
 
 function Test-KeepScriptAfterValueOption {
@@ -1107,6 +1158,26 @@ function Test-BashKeywordValidationIgnoresInheritedOptions {
     Assert-LocalDataPreserved $pwshRoot $projectName
     Assert-LocalDataPreserved $bashRoot $projectName
     Assert-True (Test-Path -LiteralPath (Join-Path $bashRoot "src/$projectName/$projectName.csproj")) 'Bash did not generate the valid mixed-case project name.'
+}
+
+function Test-BashOptionNamesAreCaseSensitive {
+    $root = Join-Path $tempRoot 'reject-uppercase-option-with-nocasematch'
+    Copy-Template $root
+    Add-LocalData $root
+    $before = Get-TreeSnapshot $root
+
+    $result = Invoke-Native 'bash' @(
+        '-O', 'nocasematch',
+        './scripts/init.sh',
+        '--PROJECT-NAME', 'Acme.WrongCase',
+        '--AUTHOR', 'Wrong Case Author',
+        '--KEEP-SCRIPT'
+    ) $root -ExpectFailure
+    $after = Get-TreeSnapshot $root
+
+    Assert-True ($result.Output -match 'unknown argument: --PROJECT-NAME') "Bash accepted or misreported an uppercase option under inherited nocasematch: $($result.Output)"
+    Assert-True ($result.Output -notmatch 'Preflight validated') 'Bash entered preflight after an uppercase option under inherited nocasematch.'
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) 'Bash changed the tree after an uppercase option under inherited nocasematch.'
 }
 
 function Test-NumericLookingBase64 {
@@ -1341,6 +1412,7 @@ try {
     Test-RejectedInput 'pwsh' 'owner'
     Test-RejectedInput 'bash' 'owner'
     Test-RequiredOptionValues
+    Test-OptionalEmptyValuesUseFallbacks
     Test-KeepScriptAfterValueOption
     $invalidProjectNames = @(
         @{
@@ -1400,6 +1472,7 @@ try {
     }
     Test-BashAsciiValidationLocaleIndependent
     Test-BashKeywordValidationIgnoresInheritedOptions
+    Test-BashOptionNamesAreCaseSensitive
     Test-PreflightCollision 'pwsh' 'rename'
     Test-PreflightCollision 'bash' 'rename'
     Test-PreflightCollision 'pwsh' 'settings'
