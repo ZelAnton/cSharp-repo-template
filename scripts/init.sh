@@ -181,6 +181,7 @@ assert_changeable_parent() {
   done
   [ -d "$parent" ] || die "$role parent is not a directory: $relative. No files were changed."
   [ -w "$parent" ] || die "$role parent is not writable: $relative. No files were changed."
+  [ -x "$parent" ] || die "$role parent is not traversable: $relative. No files were changed."
 }
 
 assert_no_link_components "scripts/init-plan.tsv" "plan"
@@ -265,6 +266,7 @@ for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
       transformed="$(replace_tokens "$content" "$mode"; printf x)"; transformed="${transformed%x}"
       if [ "$transformed" != "$content" ]; then
         [ -w "$source" ] || die "template content path is not writable: $source_relative. No files were changed."
+        assert_changeable_parent "$source" "$source_relative" "template content replacement"
         content_paths[${#content_paths[@]}]="$source"
         content_values[${#content_values[@]}]="$transformed"
       fi
@@ -313,6 +315,8 @@ echo "    Preflight validated ${#plan_kinds[@]} template-owned operation(s)."
 staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/csharp-template-init.XXXXXXXX")"
 declare -a backup_originals=()
 declare -a backup_copies=()
+declare -a mutated_backup_originals=()
+declare -a mutated_backup_copies=()
 declare -a completed_move_sources=()
 declare -a completed_move_targets=()
 declare -a created_directories=()
@@ -333,9 +337,9 @@ rollback_transaction() {
       mv -- "${completed_move_targets[$i]}" "${completed_move_sources[$i]}" || rollback_failed=1
     fi
   done
-  for ((i = 0; i < ${#backup_originals[@]}; i++)); do
-    original="${backup_originals[$i]}"
-    backup="${backup_copies[$i]}"
+  for ((i = 0; i < ${#mutated_backup_originals[@]}; i++)); do
+    original="${mutated_backup_originals[$i]}"
+    backup="${mutated_backup_copies[$i]}"
     restore_file "$backup" "$original" || rollback_failed=1
   done
   for ((i = ${#created_directories[@]} - 1; i >= 0; i--)); do
@@ -367,6 +371,23 @@ backup_file() {
   backup_copies[${#backup_copies[@]}]="$backup"
 }
 
+journal_backup() {
+  local original="$1"
+  local existing
+  local i
+  for existing in "${mutated_backup_originals[@]-}"; do
+    [ "$existing" != "$original" ] || return 0
+  done
+  for ((i = 0; i < ${#backup_originals[@]}; i++)); do
+    if [ "${backup_originals[$i]}" = "$original" ]; then
+      mutated_backup_originals[${#mutated_backup_originals[@]}]="$original"
+      mutated_backup_copies[${#mutated_backup_copies[@]}]="${backup_copies[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 replace_file_content() {
   local original="$1"
   local content="$2"
@@ -383,6 +404,7 @@ replace_file_content() {
     rm -f -- "$temporary"
     return 1
   fi
+  journal_backup "$original"
 }
 
 restore_file() {
@@ -426,21 +448,22 @@ echo "    Updated contents in ${#content_paths[@]} file(s)."
 for ((i = 0; i < ${#directory_sources[@]}; i++)); do
   assert_no_link_components "${directory_sources[$i]#"$repo_root/"}" "directory source"
   assert_no_link_components "${directory_targets[$i]#"$repo_root/"}" "directory destination"
-  created_directories[${#created_directories[@]}]="${directory_targets[$i]}"
   mkdir -- "${directory_targets[$i]}"
+  created_directories[${#created_directories[@]}]="${directory_targets[$i]}"
 done
 for ((i = 0; i < ${#move_sources[@]}; i++)); do
   assert_no_link_components "${move_sources[$i]#"$repo_root/"}" "move source"
   assert_no_link_components "${move_targets[$i]#"$repo_root/"}" "move destination"
+  mv -- "${move_sources[$i]}" "${move_targets[$i]}"
   completed_move_sources[${#completed_move_sources[@]}]="${move_sources[$i]}"
   completed_move_targets[${#completed_move_targets[@]}]="${move_targets[$i]}"
-  mv -- "${move_sources[$i]}" "${move_targets[$i]}"
   echo "    Moved ${move_sources[$i]#"$repo_root/"} -> ${move_targets[$i]#"$repo_root/"}"
 done
 for path in "${remove_paths[@]}"; do
   if [ -f "$path" ]; then
     assert_no_link_components "${path#"$repo_root/"}" "removal source"
     rm -f -- "$path"
+    journal_backup "$path"
     echo "    Removed ${path#"$repo_root/"}"
   fi
 done
@@ -459,8 +482,14 @@ for path in "$repo_root/docs" "$repo_root/scripts/tests"; do
 done
 
 if [ "$keep_script" -ne 1 ]; then
-  rm -f -- "$sibling_ps1"
-  rm -f -- "$self"
+  if [ -f "$sibling_ps1" ]; then
+    rm -f -- "$sibling_ps1"
+    journal_backup "$sibling_ps1"
+  fi
+  if [ -f "$self" ]; then
+    rm -f -- "$self"
+    journal_backup "$self"
+  fi
 fi
 
 trap - ERR INT TERM

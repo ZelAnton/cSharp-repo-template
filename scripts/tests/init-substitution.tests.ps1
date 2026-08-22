@@ -42,6 +42,25 @@ function Get-FileSecurityDescriptor([string]$path) {
     return "$($descriptor.Owner.Value):$($descriptor.Group.Value):$([int]$descriptor.ControlFlags):$($accessRules -join ',')"
 }
 
+function Get-DirectorySecurityDescriptor([string]$path) {
+    $sections =
+        [Security.AccessControl.AccessControlSections]::Owner -bor
+        [Security.AccessControl.AccessControlSections]::Group -bor
+        [Security.AccessControl.AccessControlSections]::Access
+    $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($path), $sections)
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new(
+        $security.GetSecurityDescriptorSddlForm($sections)
+    )
+    $accessRules = @(
+        foreach ($rule in $descriptor.DiscretionaryAcl) {
+            $binary = [byte[]]::new($rule.BinaryLength)
+            $rule.GetBinaryForm($binary, 0)
+            [Convert]::ToHexString($binary)
+        }
+    ) | Sort-Object
+    return "$($descriptor.Owner.Value):$($descriptor.Group.Value):$([int]$descriptor.ControlFlags):$($accessRules -join ',')"
+}
+
 function Protect-FileAccessRules([string]$path) {
     $sections =
         [Security.AccessControl.AccessControlSections]::Owner -bor
@@ -56,6 +75,18 @@ function Get-FileMetadataSnapshot([string]$path) {
     $item = Get-Item -LiteralPath $path -Force
     $permissions = if ($IsWindows) {
         Get-FileSecurityDescriptor $path
+    }
+    else {
+        [int][IO.File]::GetUnixFileMode($path)
+    }
+    $creationTime = if ($IsWindows) { $item.CreationTimeUtc.Ticks } else { '' }
+    return "$([int64]$item.Attributes):$creationTime`:$($item.LastWriteTimeUtc.Ticks):$permissions"
+}
+
+function Get-DirectoryMetadataSnapshot([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force
+    $permissions = if ($IsWindows) {
+        Get-DirectorySecurityDescriptor $path
     }
     else {
         [int][IO.File]::GetUnixFileMode($path)
@@ -400,6 +431,181 @@ function Test-HardLinkContentIsolation([string]$initializer) {
     Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer left the repository file linked to the external target."
 }
 
+function Test-BashContentReplacementPermissionOnNativeFileSystem {
+    $script = @'
+set -euo pipefail
+fixture="$(mktemp -d "$HOME/csharp-template-init-permission.XXXXXXXX")"
+root="$fixture/repo"
+mkdir -p "$root" "$fixture/tmp"
+cleanup() {
+  chmod u+w "$root" 2>/dev/null || true
+  rm -rf -- "$fixture"
+}
+trap cleanup EXIT
+
+tar \
+  --exclude='./.git' \
+  --exclude='./.jj' \
+  --exclude='./.work' \
+  --exclude='./bin' \
+  --exclude='./obj' \
+  --exclude='./artifacts' \
+  -cf - . | tar -C "$root" -xf -
+
+snapshot() {
+  (
+    cd "$root"
+    find . -printf '%y|%P|%m|%s|%T@\n' | sort
+    find . -type f -print0 | sort -z | xargs -0 sha256sum
+  )
+}
+
+chmod a-w "$root"
+[ -w "$root/README.md" ]
+if [ -w "$root" ]; then
+  printf '%s\n' 'SKIP bash-native-content-replacement-permission-preflight: filesystem does not expose Unix directory modes'
+  exit 0
+fi
+before="$(snapshot)"
+set +e
+output="$({
+  cd "$root"
+  TMPDIR="$fixture/tmp" bash ./scripts/init.sh \
+    --project-name Acme.ReplacementPermission \
+    --author 'Permission Author' \
+    --author-email permission@example.invalid \
+    --github-owner safe-owner \
+    --description 'Replacement permission regression' \
+    --year 2042 \
+    --keep-script
+} 2>&1)"
+exit_code=$?
+set -e
+[ "$exit_code" -ne 0 ]
+grep -qi 'parent is not writable' <<< "$output"
+! grep -q 'Preflight validated' <<< "$output"
+! grep -qi 'rollback' <<< "$output"
+[ "$before" = "$(snapshot)" ]
+! find "$root" -name '.csharp-template-init-*' -print -quit | grep -q .
+printf '%s\n' 'PASS bash-native-content-replacement-permission-preflight'
+'@
+    $runner = Join-Path $repoRoot '.bash-permission-test.sh'
+    [IO.File]::WriteAllText($runner, $script.Replace("`r`n", "`n"), $utf8NoBom)
+    try {
+        $null = Invoke-Native 'bash' @('./.bash-permission-test.sh') $repoRoot
+    }
+    finally {
+        Remove-Item -LiteralPath $runner -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ContentReplacementPermissionPreflight([string]$initializer) {
+    if ($IsWindows -and $initializer -eq 'bash') {
+        Test-BashContentReplacementPermissionOnNativeFileSystem
+        return
+    }
+
+    $projectName = 'Acme.ReplacementPermission'
+    $root = Join-Path $tempRoot "replacement-permission-$initializer"
+    Copy-Template $root
+    $target = Join-Path $root 'README.md'
+    $originalDirectorySecurity = $null
+    $originalFileSecurity = $null
+    $originalDirectoryMode = $null
+
+    try {
+        if ($IsWindows) {
+            $sections = [Security.AccessControl.AccessControlSections]::Access
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $directorySecurity = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($root), $sections)
+            $originalDirectorySecurity = $directorySecurity.GetSecurityDescriptorSddlForm($sections)
+            $directorySecurity.SetAccessRuleProtection($true, $true)
+            $directorySecurity.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $identity,
+                [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
+                [Security.AccessControl.AccessControlType]::Deny
+            ))
+            [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($root), $directorySecurity)
+
+            $fileSecurity = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($target), $sections)
+            $originalFileSecurity = $fileSecurity.GetSecurityDescriptorSddlForm($sections)
+            $fileSecurity.SetAccessRuleProtection($true, $true)
+            $fileSecurity.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $identity,
+                [Security.AccessControl.FileSystemRights]::Delete,
+                [Security.AccessControl.AccessControlType]::Deny
+            ))
+            [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($target), $fileSecurity)
+        }
+        else {
+            $originalDirectoryMode = [IO.File]::GetUnixFileMode($root)
+            $writeModes =
+                [IO.UnixFileMode]::UserWrite -bor
+                [IO.UnixFileMode]::GroupWrite -bor
+                [IO.UnixFileMode]::OtherWrite
+            [IO.File]::SetUnixFileMode($root, $originalDirectoryMode -band (-bnot $writeModes))
+        }
+
+        $writeProbe = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+        $writeProbe.Dispose()
+
+        $before = Get-TreeSnapshot $root
+        $directoryMetadataBefore = Get-DirectoryMetadataSnapshot $root
+        $fileMetadataBefore = Get-FileMetadataSnapshot $target
+        $arguments = @(
+            '--project-name', $projectName,
+            '--author', 'Permission Author',
+            '--author-email', 'permission@example.invalid',
+            '--github-owner', 'safe-owner',
+            '--description', 'Replacement permission regression',
+            '--year', '2042',
+            '--keep-script'
+        )
+        $result = if ($initializer -eq 'pwsh') {
+            Invoke-Native 'pwsh' @(
+                '-NoProfile',
+                '-File', './scripts/init.ps1',
+                '-ProjectName', $projectName,
+                '-Author', 'Permission Author',
+                '-AuthorEmail', 'permission@example.invalid',
+                '-GitHubOwner', 'safe-owner',
+                '-Description', 'Replacement permission regression',
+                '-Year', '2042',
+                '-KeepScript'
+            ) $root -ExpectFailure
+        }
+        else {
+            Invoke-Native 'bash' (@('./scripts/init.sh') + $arguments) $root -ExpectFailure
+        }
+
+        Assert-True ($result.Output -match '(?i)(directory entry cannot be replaced|sibling temporary file|not writable|not traversable)') "$initializer did not report the content replacement permission failure clearly: $($result.Output)"
+        Assert-True ($result.Output -notmatch 'Preflight validated') "$initializer started mutations after the content replacement permission failure."
+        Assert-True ($result.Output -notmatch '(?i)rollback') "$initializer attempted rollback for a preflight-only failure."
+        Assert-True (@(Compare-Object $before (Get-TreeSnapshot $root)).Count -eq 0) "$initializer changed the tree after the content replacement permission failure."
+        Assert-Equal $directoryMetadataBefore (Get-DirectoryMetadataSnapshot $root) "$initializer changed parent ACL/mode, attributes, or timestamps during content preflight."
+        Assert-Equal $fileMetadataBefore (Get-FileMetadataSnapshot $target) "$initializer changed target ACL/mode, attributes, or timestamps during content preflight."
+        $temporaryFiles = @(Get-ChildItem -LiteralPath $root -Force -Recurse -Filter '.csharp-template-init-*')
+        Assert-True ($temporaryFiles.Count -eq 0) "$initializer left a sibling temporary file after the content replacement permission failure."
+    }
+    finally {
+        if ($IsWindows) {
+            if ($originalFileSecurity) {
+                $security = [Security.AccessControl.FileSecurity]::new()
+                $security.SetSecurityDescriptorSddlForm($originalFileSecurity, $sections)
+                [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($target), $security)
+            }
+            if ($originalDirectorySecurity) {
+                $security = [Security.AccessControl.DirectorySecurity]::new()
+                $security.SetSecurityDescriptorSddlForm($originalDirectorySecurity, $sections)
+                [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($root), $security)
+            }
+        }
+        elseif ($null -ne $originalDirectoryMode) {
+            [IO.File]::SetUnixFileMode($root, $originalDirectoryMode)
+        }
+    }
+}
+
 function Test-LateFailureRollback([string]$initializer) {
     $projectName = 'Acme.Rollback'
     $root = Join-Path $tempRoot "rollback-$initializer"
@@ -458,7 +664,7 @@ Set-Location $Root
         $realMove = (Invoke-Native 'bash' @('-c', 'command -v mv') $root).Output.Trim()
         $shim = @"
 #!/usr/bin/env bash
-state='/tmp/$stateName'
+state='./.test-shim/$stateName'
 count=0
 if [ "`$1" = '-f' ]; then
   exec '$realMove' "`$@"
@@ -476,7 +682,7 @@ exec '$realMove' "`$@"
         $null = Invoke-Native 'bash' @('-c', 'chmod +x ./.test-shim/mv') $root
         $before = Get-TreeSnapshot $root
         $result = Invoke-BashInitializer $root $projectName 'Rollback Author' 'rollback@example.invalid' 'safe-owner' 'Rollback regression' '2042' -ExpectFailure -PathPrefix './.test-shim'
-        $null = Invoke-Native 'bash' @('-c', "rm -f '/tmp/$stateName'") $root
+        $null = Invoke-Native 'bash' @('-c', "rm -f './.test-shim/$stateName'") $root
     }
 
     $after = Get-TreeSnapshot $root
@@ -901,6 +1107,8 @@ try {
     Test-LinkSafety 'bash' 'directory'
     Test-HardLinkContentIsolation 'pwsh'
     Test-HardLinkContentIsolation 'bash'
+    Test-ContentReplacementPermissionPreflight 'pwsh'
+    Test-ContentReplacementPermissionPreflight 'bash'
     Test-LateFailureRollback 'pwsh'
     Test-LateFailureRollback 'bash'
 

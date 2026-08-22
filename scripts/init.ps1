@@ -197,6 +197,182 @@ function Test-SamePlanPath([string]$left, [string]$right) {
     return [string]::Equals($left, $right, $comparison)
 }
 
+if ($IsWindows -and -not ('TemplateInitializerWindowsAccess' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class TemplateInitializerWindowsAccess
+{
+    private const uint TokenDuplicate = 0x0002;
+    private const uint TokenQuery = 0x0008;
+    private const int SecurityImpersonation = 2;
+    private const int ErrorInsufficientBuffer = 122;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GenericMapping
+    {
+        internal uint GenericRead;
+        internal uint GenericWrite;
+        internal uint GenericExecute;
+        internal uint GenericAll;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(
+        IntPtr processHandle,
+        uint desiredAccess,
+        out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateToken(
+        IntPtr existingTokenHandle,
+        int impersonationLevel,
+        out IntPtr duplicateTokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AccessCheck(
+        [In] byte[] securityDescriptor,
+        IntPtr clientToken,
+        uint desiredAccess,
+        ref GenericMapping genericMapping,
+        IntPtr privilegeSet,
+        ref uint privilegeSetLength,
+        out uint grantedAccess,
+        [MarshalAs(UnmanagedType.Bool)] out bool accessStatus);
+
+    public static bool IsGranted(byte[] securityDescriptor, uint desiredAccess)
+    {
+        IntPtr primaryToken = IntPtr.Zero;
+        IntPtr impersonationToken = IntPtr.Zero;
+        IntPtr privilegeSet = IntPtr.Zero;
+        try
+        {
+            if (!OpenProcessToken(GetCurrentProcess(), TokenQuery | TokenDuplicate, out primaryToken))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            if (!DuplicateToken(primaryToken, SecurityImpersonation, out impersonationToken))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            GenericMapping mapping = new GenericMapping
+            {
+                GenericRead = 0x00120089,
+                GenericWrite = 0x00120116,
+                GenericExecute = 0x001200A0,
+                GenericAll = 0x001F01FF,
+            };
+            uint privilegeSetLength = 0;
+            uint grantedAccess;
+            bool accessStatus;
+            if (AccessCheck(
+                securityDescriptor,
+                impersonationToken,
+                desiredAccess,
+                ref mapping,
+                IntPtr.Zero,
+                ref privilegeSetLength,
+                out grantedAccess,
+                out accessStatus))
+            {
+                return accessStatus && (grantedAccess & desiredAccess) == desiredAccess;
+            }
+
+            int error = Marshal.GetLastWin32Error();
+            if (error != ErrorInsufficientBuffer)
+            {
+                throw new Win32Exception(error);
+            }
+
+            privilegeSet = Marshal.AllocHGlobal(checked((int)privilegeSetLength));
+            if (!AccessCheck(
+                securityDescriptor,
+                impersonationToken,
+                desiredAccess,
+                ref mapping,
+                privilegeSet,
+                ref privilegeSetLength,
+                out grantedAccess,
+                out accessStatus))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            return accessStatus && (grantedAccess & desiredAccess) == desiredAccess;
+        }
+        finally
+        {
+            if (privilegeSet != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(privilegeSet);
+            }
+            if (impersonationToken != IntPtr.Zero)
+            {
+                CloseHandle(impersonationToken);
+            }
+            if (primaryToken != IntPtr.Zero)
+            {
+                CloseHandle(primaryToken);
+            }
+        }
+    }
+}
+'@
+}
+
+function Test-WindowsEffectiveAccess([string]$fullPath, [Security.AccessControl.FileSystemRights]$right) {
+    $sections =
+        [Security.AccessControl.AccessControlSections]::Owner -bor
+        [Security.AccessControl.AccessControlSections]::Group -bor
+        [Security.AccessControl.AccessControlSections]::Access
+    $security = if (Test-Path -LiteralPath $fullPath -PathType Container) {
+        [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($fullPath), $sections)
+    }
+    else {
+        [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($fullPath), $sections)
+    }
+    return [TemplateInitializerWindowsAccess]::IsGranted(
+        $security.GetSecurityDescriptorBinaryForm(),
+        [uint32][int64]$right
+    )
+}
+
+function Assert-ContentCanBeReplaced([pscustomobject]$path, [string]$role) {
+    Assert-FileCanBeChanged $path $role
+    $parent = [IO.Path]::GetDirectoryName($path.FullPath)
+    if ($IsWindows) {
+        try {
+            $canCreateTemporary = Test-WindowsEffectiveAccess $parent ([Security.AccessControl.FileSystemRights]::CreateFiles)
+            $canDeleteTarget = Test-WindowsEffectiveAccess $path.FullPath ([Security.AccessControl.FileSystemRights]::Delete)
+            $canDeleteChild = Test-WindowsEffectiveAccess $parent ([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles)
+        }
+        catch {
+            throw "$role replacement permissions cannot be validated: $($path.Relative). No files were changed."
+        }
+        if (-not $canCreateTemporary) {
+            throw "$role parent does not permit a sibling temporary file: $($path.Relative). No files were changed."
+        }
+        if (-not ($canDeleteTarget -or $canDeleteChild)) {
+            throw "$role directory entry cannot be replaced: $($path.Relative). No files were changed."
+        }
+    }
+    else {
+        Assert-DirectoryCanBeChanged $parent $path.Relative "$role replacement"
+    }
+}
+
 function Assert-NoReparsePoint([pscustomobject]$path, [string]$role) {
     $current = $repoRoot
     foreach ($segment in $path.Relative.Split('/')) {
@@ -296,30 +472,53 @@ function Set-PostReplacementMetadata([string]$fullPath, [pscustomobject]$metadat
 function Set-FileContentSafely(
     [pscustomobject]$path,
     [string]$content,
-    [Text.Encoding]$encoding
+    [Text.Encoding]$encoding,
+    [pscustomobject]$backup,
+    [Collections.Generic.List[object]]$mutatedBackups,
+    [Collections.Generic.HashSet[string]]$mutatedBackupPaths
 ) {
     $metadata = Get-FileMetadata $path.FullPath
     $temporaryPath = Join-Path ([IO.Path]::GetDirectoryName($path.FullPath)) ".csharp-template-init-$([Guid]::NewGuid().ToString('N')).tmp"
+    $stream = $null
     $writer = $null
+    $swapped = $false
     try {
         $stream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         $writer = [IO.StreamWriter]::new($stream, $encoding)
         $writer.Write($content)
         $writer.Dispose()
         $writer = $null
+        $stream = $null
 
         Set-FileMetadata $temporaryPath $metadata
 
         # Replacing the directory entry prevents a hard-linked peer outside the repository from being truncated.
         [IO.File]::Move($temporaryPath, $path.FullPath, $true)
+        $swapped = $true
+        if ($mutatedBackupPaths.Add($backup.Original)) {
+            $mutatedBackups.Add($backup)
+        }
         Set-PostReplacementMetadata $path.FullPath $metadata
     }
     finally {
-        if ($writer) {
-            $writer.Dispose()
+        try {
+            if ($writer) {
+                $writer.Dispose()
+            }
+            elseif ($stream) {
+                $stream.Dispose()
+            }
         }
-        if (Test-Path -LiteralPath $temporaryPath) {
-            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+        finally {
+            if (Test-Path -LiteralPath $temporaryPath) {
+                try {
+                    Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction Stop
+                }
+                catch {
+                    $phase = if ($swapped) { 'after replacement' } else { 'before replacement' }
+                    throw "Temporary content file could not be cleaned up ${phase}: $($path.Relative)."
+                }
+            }
         }
     }
 }
@@ -397,13 +596,15 @@ function Assert-DirectoryCanBeChanged([string]$fullPath, [string]$relative, [str
         }
     }
     else {
-        $mode = [IO.File]::GetUnixFileMode($current)
-        $writeModes =
-            [IO.UnixFileMode]::UserWrite -bor
-            [IO.UnixFileMode]::GroupWrite -bor
-            [IO.UnixFileMode]::OtherWrite
-        if (($mode -band $writeModes) -eq 0) {
+        & /usr/bin/test -w $current
+        $canWrite = $LASTEXITCODE -eq 0
+        & /usr/bin/test -x $current
+        $canTraverse = $LASTEXITCODE -eq 0
+        if (-not $canWrite) {
             throw "$role parent is not writable: $relative. No files were changed."
+        }
+        if (-not $canTraverse) {
+            throw "$role parent is not traversable: $relative. No files were changed."
         }
     }
 }
@@ -465,7 +666,7 @@ foreach ($operation in $plan) {
             $map = if ($xmlFileExtensions -contains $extension) { $xmlReplacements } else { $replacements }
             $newText = Replace-Tokens $text $map
             if ($newText -cne $text) {
-                Assert-FileCanBeChanged $operation.Source 'Template content'
+                Assert-ContentCanBeReplaced $operation.Source 'Template content'
                 $contentWrites += [pscustomobject]@{
                     Path = $operation.Source
                     Content = $newText
@@ -537,6 +738,10 @@ $completedMoves = @()
 $createdDirectories = @()
 $removedDirectories = @()
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
+$pathComparer = if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }
+$backupByPath = [Collections.Generic.Dictionary[string, object]]::new($pathComparer)
+$mutatedBackups = [Collections.Generic.List[object]]::new()
+$mutatedBackupPaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
 
 try {
     [IO.Directory]::CreateDirectory($stagingRoot) | Out-Null
@@ -557,7 +762,7 @@ try {
         }
     }
 
-    $backedUp = [Collections.Generic.HashSet[string]]::new($(if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
+    $backedUp = [Collections.Generic.HashSet[string]]::new($pathComparer)
     foreach ($original in $backupPaths) {
         if (-not $backedUp.Add($original)) {
             continue
@@ -565,16 +770,18 @@ try {
         $metadata = Get-FileMetadata $original
         $backup = Join-Path $stagingRoot "$($backupRecords.Count).bak"
         [IO.File]::Copy($original, $backup, $false)
-        $backupRecords += [pscustomobject]@{
+        $record = [pscustomobject]@{
             Original = $original
             Backup = $backup
             Metadata = $metadata
         }
+        $backupRecords += $record
+        $backupByPath.Add($original, $record)
     }
 
     foreach ($write in $contentWrites) {
         Assert-NoReparsePoint $write.Path 'content source'
-        Set-FileContentSafely $write.Path $write.Content $utf8NoBom
+        Set-FileContentSafely $write.Path $write.Content $utf8NoBom $backupByPath[$write.Path.FullPath] $mutatedBackups $mutatedBackupPaths
     }
     Write-Host "    Updated contents in $($contentWrites.Count) file(s)." -ForegroundColor DarkGray
 
@@ -587,8 +794,8 @@ try {
         ) {
             Assert-NoReparsePoint $operation.Source 'directory source'
             Assert-NoReparsePoint $operation.Destination 'directory destination'
-            $createdDirectories += $operation.Destination.FullPath
             [IO.Directory]::CreateDirectory($operation.Destination.FullPath) | Out-Null
+            $createdDirectories += $operation.Destination.FullPath
         }
     }
 
@@ -599,8 +806,8 @@ try {
         ) {
             Assert-NoReparsePoint $operation.Source 'move source'
             Assert-NoReparsePoint $operation.Destination 'move destination'
-            $completedMoves += $operation
             Move-Item -LiteralPath $operation.Source.FullPath -Destination $operation.Destination.FullPath
+            $completedMoves += $operation
             Write-Host "    Moved $($operation.Source.Relative) -> $($operation.Destination.Relative)" -ForegroundColor DarkGray
         }
     }
@@ -609,6 +816,10 @@ try {
         if (Test-Path -LiteralPath $operation.Source.FullPath -PathType Leaf) {
             Assert-NoReparsePoint $operation.Source 'removal source'
             Remove-Item -LiteralPath $operation.Source.FullPath -Force
+            $backup = $backupByPath[$operation.Source.FullPath]
+            if ($mutatedBackupPaths.Add($backup.Original)) {
+                $mutatedBackups.Add($backup)
+            }
             Write-Host "    Removed $($operation.Source.Relative)" -ForegroundColor DarkGray
         }
     }
@@ -639,6 +850,10 @@ try {
         foreach ($initializer in @((Join-Path $PSScriptRoot 'init.sh'), $selfPath)) {
             if (Test-Path -LiteralPath $initializer -PathType Leaf) {
                 Remove-Item -LiteralPath $initializer -Force
+                $backup = $backupByPath[$initializer]
+                if ($mutatedBackupPaths.Add($backup.Original)) {
+                    $mutatedBackups.Add($backup)
+                }
             }
         }
     }
@@ -665,7 +880,7 @@ catch {
             $rollbackErrors.Add($_.Exception.Message)
         }
     }
-    foreach ($backup in $backupRecords) {
+    foreach ($backup in $mutatedBackups) {
         try {
             Restore-FileSafely $backup
         }
