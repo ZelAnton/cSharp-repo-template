@@ -789,6 +789,11 @@ function Assert-GeneratedValues(
     $workflow = [IO.File]::ReadAllText((Join-Path $root '.github/workflows/release.yml'))
     Assert-WorkflowIdentitySerialization $root $author $authorEmail
     Assert-True $workflow.Contains("repo = `"https://github.com/$githubOwner/$projectName`"") 'Python repository URL was not generated safely.'
+
+    $dockerVolume = "$projectName-nuget"
+    $linuxTestScript = [IO.File]::ReadAllText((Join-Path $root 'scripts/test-linux.ps1'))
+    Assert-True ($dockerVolume -cmatch '^[A-Za-z0-9][A-Za-z0-9_.-]+$') 'Generated Docker volume name is not portable.'
+    Assert-True $linuxTestScript.Contains("`$NugetVolume = '$dockerVolume'") 'Linux test helper does not use the validated Docker volume name.'
 }
 
 function Test-ScriptSyntax([string]$root) {
@@ -893,6 +898,28 @@ function Test-RejectedInput([string]$initializer, [string]$field) {
 
     Assert-True (Test-Path -LiteralPath (Join-Path $root 'src/__ProjectName__')) 'Rejected input modified the template before failing.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'INJECTED'))) 'Rejected input executed a command.'
+}
+
+function Test-RejectedProjectName(
+    [string]$initializer,
+    [string]$caseName,
+    [string]$projectName,
+    [string]$expectedMessage
+) {
+    $root = Join-Path $tempRoot "reject-project-name-$initializer-$caseName"
+    Copy-Template $root
+    Add-LocalData $root
+    $before = Get-TreeSnapshot $root
+
+    $result = Invoke-InitializerExpectingFailure $initializer $root $projectName
+    $after = Get-TreeSnapshot $root
+    $normalizedOutput = [regex]::Replace($result.Output, '(?m)^[ \t]*\|[ \t]?', '')
+    $normalizedOutput = [regex]::Replace($normalizedOutput, '\s+', ' ')
+
+    Assert-True $normalizedOutput.Contains($expectedMessage) "$initializer did not report the ProjectName rule exactly for '$projectName': $($result.Output)"
+    Assert-True ($result.Output -notmatch 'Preflight validated') "$initializer entered the mutation phase after rejecting ProjectName '$projectName'."
+    Assert-True ($result.Output -notmatch '(?i)rollback') "$initializer attempted rollback after rejecting ProjectName '$projectName' before mutation."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the tree after rejecting ProjectName '$projectName'."
 }
 
 function Test-NumericLookingBase64 {
@@ -1125,6 +1152,52 @@ try {
     Test-RejectedInput 'bash' 'newline'
     Test-RejectedInput 'pwsh' 'owner'
     Test-RejectedInput 'bash' 'owner'
+    $invalidProjectNames = @(
+        @{
+            Case = 'con'
+            Name = 'CON'
+            Message = "Invalid ProjectName 'CON': Windows reserves the base name 'CON' (case-insensitive), including when followed by an extension. No files were changed."
+        },
+        @{
+            Case = 'aux-case-insensitive'
+            Name = 'aux'
+            Message = "Invalid ProjectName 'aux': Windows reserves the base name 'aux' (case-insensitive), including when followed by an extension. No files were changed."
+        },
+        @{
+            Case = 'com1'
+            Name = 'COM1'
+            Message = "Invalid ProjectName 'COM1': Windows reserves the base name 'COM1' (case-insensitive), including when followed by an extension. No files were changed."
+        },
+        @{
+            Case = 'device-extension'
+            Name = 'NUL.Tools'
+            Message = "Invalid ProjectName 'NUL.Tools': Windows reserves the base name 'NUL' (case-insensitive), including when followed by an extension. No files were changed."
+        },
+        @{
+            Case = 'docker-leading-underscore'
+            Name = '_Leading'
+            Message = "Invalid ProjectName '_Leading': the first character must be an ASCII letter because Docker volume names must start with an alphanumeric character. No files were changed."
+        },
+        @{
+            Case = 'csharp-keyword'
+            Name = 'Acme.class'
+            Message = "Invalid ProjectName 'Acme.class': segment 'class' is a reserved C# keyword and cannot be used as a namespace identifier. No files were changed."
+        },
+        @{
+            Case = 'nuget-length'
+            Name = ('A' * 101)
+            Message = "Invalid ProjectName '$('A' * 101)': NuGet PackageId values must be 1-100 characters. No files were changed."
+        },
+        @{
+            Case = 'csharp-shape'
+            Name = 'Acme-Bad'
+            Message = "Invalid ProjectName 'Acme-Bad': use dot-separated C# identifier segments made from ASCII letters, digits, and underscores; each segment must start with a letter or underscore. No files were changed."
+        }
+    )
+    foreach ($invalidProjectName in $invalidProjectNames) {
+        Test-RejectedProjectName 'pwsh' $invalidProjectName.Case $invalidProjectName.Name $invalidProjectName.Message
+        Test-RejectedProjectName 'bash' $invalidProjectName.Case $invalidProjectName.Name $invalidProjectName.Message
+    }
     Test-PreflightCollision 'pwsh' 'rename'
     Test-PreflightCollision 'bash' 'rename'
     Test-PreflightCollision 'pwsh' 'settings'
@@ -1145,7 +1218,7 @@ try {
     Test-LateFailureRollback 'bash'
 
     if (-not $SkipBuild) {
-        $cleanProjectName = 'Acme.CleanInit'
+        $cleanProjectName = 'Acme.CON'
         $cleanPwshRoot = Join-Path $tempRoot 'clean-pwsh'
         $cleanBashRoot = Join-Path $tempRoot 'clean-bash'
         Copy-Template $cleanPwshRoot
