@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - All GitHub Actions are pinned to a commit SHA (with a version comment) instead of a moving tag; Dependabot now groups action bumps into a single weekly PR.
 
 ### Fixed
+- Template initialization now changes only an explicit template-owned inventory, rejects local collisions and symbolic path escapes, preserves external hard-linked peers, and rolls back late I/O failures.
 - Release versioning now selects the highest exact stable SemVer tag reachable from the pinned source and checks tag existence through unambiguous tag refs.
 - First-release changelog auto-fill now includes release-worthy changes from the repository's root commit.
 - NuGet packages now contain the same versioned changelog state used for release notes and the release tag.

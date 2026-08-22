@@ -23,6 +23,78 @@ function Assert-True([bool]$condition, [string]$message) {
     }
 }
 
+function Get-FileSecurityDescriptor([string]$path) {
+    $sections =
+        [Security.AccessControl.AccessControlSections]::Owner -bor
+        [Security.AccessControl.AccessControlSections]::Group -bor
+        [Security.AccessControl.AccessControlSections]::Access
+    $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($path), $sections)
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new(
+        $security.GetSecurityDescriptorSddlForm($sections)
+    )
+    $accessRules = @(
+        foreach ($rule in $descriptor.DiscretionaryAcl) {
+            $binary = [byte[]]::new($rule.BinaryLength)
+            $rule.GetBinaryForm($binary, 0)
+            [Convert]::ToHexString($binary)
+        }
+    ) | Sort-Object
+    return "$($descriptor.Owner.Value):$($descriptor.Group.Value):$([int]$descriptor.ControlFlags):$($accessRules -join ',')"
+}
+
+function Get-DirectorySecurityDescriptor([string]$path) {
+    $sections =
+        [Security.AccessControl.AccessControlSections]::Owner -bor
+        [Security.AccessControl.AccessControlSections]::Group -bor
+        [Security.AccessControl.AccessControlSections]::Access
+    $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($path), $sections)
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new(
+        $security.GetSecurityDescriptorSddlForm($sections)
+    )
+    $accessRules = @(
+        foreach ($rule in $descriptor.DiscretionaryAcl) {
+            $binary = [byte[]]::new($rule.BinaryLength)
+            $rule.GetBinaryForm($binary, 0)
+            [Convert]::ToHexString($binary)
+        }
+    ) | Sort-Object
+    return "$($descriptor.Owner.Value):$($descriptor.Group.Value):$([int]$descriptor.ControlFlags):$($accessRules -join ',')"
+}
+
+function Protect-FileAccessRules([string]$path) {
+    $sections =
+        [Security.AccessControl.AccessControlSections]::Owner -bor
+        [Security.AccessControl.AccessControlSections]::Group -bor
+        [Security.AccessControl.AccessControlSections]::Access
+    $security = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($path), $sections)
+    $security.SetAccessRuleProtection($true, $true)
+    [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($path), $security)
+}
+
+function Get-FileMetadataSnapshot([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force
+    $permissions = if ($IsWindows) {
+        Get-FileSecurityDescriptor $path
+    }
+    else {
+        [int][IO.File]::GetUnixFileMode($path)
+    }
+    $creationTime = if ($IsWindows) { $item.CreationTimeUtc.Ticks } else { '' }
+    return "$([int64]$item.Attributes):$creationTime`:$($item.LastWriteTimeUtc.Ticks):$permissions"
+}
+
+function Get-DirectoryMetadataSnapshot([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force
+    $permissions = if ($IsWindows) {
+        Get-DirectorySecurityDescriptor $path
+    }
+    else {
+        [int][IO.File]::GetUnixFileMode($path)
+    }
+    $creationTime = if ($IsWindows) { $item.CreationTimeUtc.Ticks } else { '' }
+    return "$([int64]$item.Attributes):$creationTime`:$($item.LastWriteTimeUtc.Ticks):$permissions"
+}
+
 function Invoke-Native(
     [string]$filePath,
     [string[]]$arguments,
@@ -61,7 +133,8 @@ function Invoke-WithEnvironment(
     [string]$filePath,
     [string[]]$arguments,
     [string]$workingDirectory,
-    [hashtable]$environment
+    [hashtable]$environment,
+    [switch]$ExpectFailure
 ) {
     $previous = @{}
     foreach ($name in $environment.Keys) {
@@ -70,7 +143,7 @@ function Invoke-WithEnvironment(
     }
 
     try {
-        return Invoke-Native $filePath $arguments $workingDirectory
+        return Invoke-Native $filePath $arguments $workingDirectory -ExpectFailure:$ExpectFailure
     }
     finally {
         foreach ($name in $environment.Keys) {
@@ -87,7 +160,8 @@ function Invoke-BashInitializer(
     [string]$githubOwner,
     [string]$description,
     [string]$year,
-    [switch]$ExpectFailure
+    [switch]$ExpectFailure,
+    [string]$PathPrefix
 ) {
     $encodedValues = @(
         $projectName,
@@ -98,9 +172,10 @@ function Invoke-BashInitializer(
         $year
     ) | ForEach-Object { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_)) }
     $runnerFile = Join-Path $workingDirectory '.init-test-runner.sh'
+    $pathSetup = if ($PathPrefix) { "export PATH='$PathPrefix':`$PATH`n" } else { '' }
     $command = @"
 #!/usr/bin/env bash
-exec ./scripts/init.sh \
+$pathSetup`nexec ./scripts/init.sh \
   --project-name "`$(printf '%s' '$($encodedValues[0])' | base64 --decode)" \
   --author "`$(printf '%s' '$($encodedValues[1])' | base64 --decode)" \
   --author-email "`$(printf '%s' '$($encodedValues[2])' | base64 --decode)" \
@@ -155,6 +230,470 @@ function Assert-TreesEqual([string]$left, [string]$right) {
         $rightHash = (Get-FileHash -LiteralPath (Join-Path $right $relative) -Algorithm SHA256).Hash
         Assert-Equal $leftHash $rightHash "Generated file differs: $relative"
     }
+}
+
+function Get-TreeSnapshot([string]$root) {
+    $entries = @()
+    foreach ($item in Get-ChildItem -LiteralPath $root -Force -Recurse) {
+        $relative = [IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            $target = @($item.Target) -join '|'
+            $entries += "L:$relative`:$($item.LinkType):$target`:$([int64]$item.Attributes)"
+        }
+        elseif ($item.PSIsContainer) {
+            $entries += "D:$relative`:$([int64]$item.Attributes)"
+        }
+        else {
+            $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+            $permissions = if ($IsWindows) {
+                Get-FileSecurityDescriptor $item.FullName
+            }
+            else {
+                [int][IO.File]::GetUnixFileMode($item.FullName)
+            }
+            $entries += "F:$relative`:$hash`:$([int64]$item.Attributes):$permissions"
+        }
+    }
+    return @($entries | Sort-Object)
+}
+
+function Add-LocalData([string]$root) {
+    [IO.File]::WriteAllText(
+        (Join-Path $root 'local-__ProjectName__.txt'),
+        "local __ProjectName__ __Author__`n",
+        $utf8NoBom
+    )
+    [IO.File]::WriteAllBytes(
+        (Join-Path $root 'local-asset.bin'),
+        [byte[]](0, 255, 1, 95, 95, 80, 114, 111, 106, 101, 99, 116, 78, 97, 109, 101, 95, 95)
+    )
+
+    foreach ($relative in @('.work', '.cache/packages', 'cache-__ProjectName__', 'src/__ProjectName__/local-data')) {
+        [IO.Directory]::CreateDirectory((Join-Path $root $relative)) | Out-Null
+    }
+    [IO.File]::WriteAllText((Join-Path $root '.work/state.json'), '{"project":"__ProjectName__"}', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $root '.cache/packages/entry.txt'), '__ProjectName__', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $root 'cache-__ProjectName__/entry.txt'), '__ProjectName__', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $root 'src/__ProjectName__/local-data/note.txt'), '__ProjectName__', $utf8NoBom)
+    [IO.File]::WriteAllBytes(
+        (Join-Path $root 'src/__ProjectName__/local-data/payload.bin'),
+        [byte[]](0, 16, 32, 127, 128, 254, 255)
+    )
+}
+
+function Assert-LocalDataPreserved([string]$root, [string]$projectName) {
+    Assert-Equal "local __ProjectName__ __Author__`n" ([IO.File]::ReadAllText((Join-Path $root 'local-__ProjectName__.txt'))) 'Unknown text file was renamed or rewritten.'
+    Assert-Equal '00-FF-01-5F-5F-50-72-6F-6A-65-63-74-4E-61-6D-65-5F-5F' ([BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $root 'local-asset.bin')))) 'Unknown binary file was changed.'
+    Assert-Equal '{"project":"__ProjectName__"}' ([IO.File]::ReadAllText((Join-Path $root '.work/state.json'))) '.work content was changed.'
+    Assert-Equal '__ProjectName__' ([IO.File]::ReadAllText((Join-Path $root '.cache/packages/entry.txt'))) 'Cache content was changed.'
+    Assert-Equal '__ProjectName__' ([IO.File]::ReadAllText((Join-Path $root 'cache-__ProjectName__/entry.txt'))) 'Unknown token-named directory was renamed or rewritten.'
+    Assert-Equal '__ProjectName__' ([IO.File]::ReadAllText((Join-Path $root 'src/__ProjectName__/local-data/note.txt'))) 'Unknown file inside the source template directory moved or changed.'
+    Assert-Equal '00-10-20-7F-80-FE-FF' ([BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $root 'src/__ProjectName__/local-data/payload.bin')))) 'Unknown binary data inside the source template directory moved or changed.'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $root "src/$projectName/local-data"))) 'Unknown source-directory content moved into the generated project.'
+}
+
+function Test-PreflightCollision([string]$initializer, [string]$collision) {
+    $projectName = 'Acme.Collision'
+    $root = Join-Path $tempRoot "collision-$initializer-$collision"
+    Copy-Template $root
+    if ($collision -eq 'settings') {
+        [IO.File]::WriteAllText((Join-Path $root '.claude/settings.json'), '{"local":true}', $utf8NoBom)
+    }
+    else {
+        [IO.File]::WriteAllText((Join-Path $root "$projectName.slnx"), 'local solution', $utf8NoBom)
+    }
+    Add-LocalData $root
+    $before = Get-TreeSnapshot $root
+
+    if ($initializer -eq 'pwsh') {
+        $result = Invoke-Native 'pwsh' @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $projectName,
+            '-Author', 'Collision Author',
+            '-AuthorEmail', 'collision@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Collision preflight regression',
+            '-Year', '2042',
+            '-KeepScript'
+        ) $root -ExpectFailure
+    }
+    else {
+        $result = Invoke-BashInitializer $root $projectName 'Collision Author' 'collision@example.invalid' 'safe-owner' 'Collision preflight regression' '2042' -ExpectFailure
+    }
+
+    $after = Get-TreeSnapshot $root
+    Assert-True ($result.Output -match '(?i)collision') "$initializer did not report the $collision collision clearly."
+    Assert-True ($result.Output -match 'No files were changed') "$initializer did not report the preflight as non-mutating."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the tree after the $collision preflight failure."
+    Assert-True (Test-Path -LiteralPath (Join-Path $root 'src/__ProjectName__/__ProjectName__.csproj')) "$initializer partially renamed the project after the $collision preflight failure."
+    Assert-True (Test-Path -LiteralPath (Join-Path $root '.claude/settings.json.template')) "$initializer partially activated settings after the $collision preflight failure."
+}
+
+function Invoke-InitializerExpectingFailure([string]$initializer, [string]$root, [string]$projectName) {
+    if ($initializer -eq 'pwsh') {
+        return Invoke-Native 'pwsh' @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $projectName,
+            '-Author', 'Safety Author',
+            '-AuthorEmail', 'safety@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Path safety regression',
+            '-Year', '2042',
+            '-KeepScript'
+        ) $root -ExpectFailure
+    }
+
+    return Invoke-BashInitializer $root $projectName 'Safety Author' 'safety@example.invalid' 'safe-owner' 'Path safety regression' '2042' -ExpectFailure
+}
+
+function Test-LinkSafety([string]$initializer, [string]$linkKind) {
+    $projectName = 'Acme.LinkSafety'
+    $root = Join-Path $tempRoot "link-$initializer-$linkKind"
+    Copy-Template $root
+
+    if ($linkKind -eq 'file') {
+        $externalRoot = Join-Path $tempRoot "external-file-$initializer"
+        if ($IsWindows) {
+            Move-Item -LiteralPath (Join-Path $root 'docs') -Destination $externalRoot
+            New-Item -ItemType Junction -Path (Join-Path $root 'docs') -Target $externalRoot | Out-Null
+        }
+        else {
+            [IO.Directory]::CreateDirectory($externalRoot) | Out-Null
+            $externalPath = Join-Path $externalRoot 'README.md'
+            [IO.File]::WriteAllText($externalPath, "external __ProjectName__`n", $utf8NoBom)
+            Remove-Item -LiteralPath (Join-Path $root 'README.md') -Force
+            New-Item -ItemType SymbolicLink -Path (Join-Path $root 'README.md') -Target $externalPath | Out-Null
+        }
+    }
+    else {
+        $externalRoot = Join-Path $tempRoot "external-directory-$initializer"
+        Move-Item -LiteralPath (Join-Path $root 'src') -Destination $externalRoot
+        $itemType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        New-Item -ItemType $itemType -Path (Join-Path $root 'src') -Target $externalRoot | Out-Null
+    }
+
+    $before = Get-TreeSnapshot $root
+    $externalBefore = Get-TreeSnapshot $externalRoot
+    $result = Invoke-InitializerExpectingFailure $initializer $root $projectName
+    $after = Get-TreeSnapshot $root
+    $externalAfter = Get-TreeSnapshot $externalRoot
+
+    Assert-True ($result.Output -match '(?i)(symbolic link|reparse point)') "$initializer did not report the unsafe $linkKind link clearly."
+    Assert-True ($result.Output -match 'No files were changed') "$initializer did not report the link rejection as non-mutating."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer changed the repository after rejecting the $linkKind link."
+    Assert-True (@(Compare-Object $externalBefore $externalAfter).Count -eq 0) "$initializer changed the external $linkKind target."
+}
+
+function Test-HardLinkContentIsolation([string]$initializer) {
+    $projectName = 'Acme.HardLinkSafety'
+    $root = Join-Path $tempRoot "hard-link-$initializer"
+    $externalRoot = Join-Path $tempRoot "external-hard-link-$initializer"
+    Copy-Template $root
+    [IO.Directory]::CreateDirectory($externalRoot) | Out-Null
+
+    $internalPath = Join-Path $root 'README.md'
+    $externalPath = Join-Path $externalRoot 'README.md'
+    [IO.File]::Copy($internalPath, $externalPath)
+    Remove-Item -LiteralPath $internalPath -Force
+    New-Item -ItemType HardLink -Path $internalPath -Target $externalPath | Out-Null
+    if ($IsWindows -and $initializer -eq 'pwsh') {
+        Protect-FileAccessRules $internalPath
+    }
+
+    $externalBefore = Get-TreeSnapshot $externalRoot
+    $internalMetadataBefore = Get-FileMetadataSnapshot $internalPath
+    if ($initializer -eq 'pwsh') {
+        $null = Invoke-Native 'pwsh' @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $projectName,
+            '-Author', 'Hard Link Author',
+            '-AuthorEmail', 'hard-link@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Hard-link isolation regression',
+            '-Year', '2042',
+            '-KeepScript'
+        ) $root
+    }
+    else {
+        $null = Invoke-BashInitializer $root $projectName 'Hard Link Author' 'hard-link@example.invalid' 'safe-owner' 'Hard-link isolation regression' '2042'
+    }
+
+    $externalAfter = Get-TreeSnapshot $externalRoot
+    Assert-True (@(Compare-Object $externalBefore $externalAfter).Count -eq 0) "$initializer changed the external hard-linked target."
+    Assert-True ([IO.File]::ReadAllText($internalPath).Contains($projectName)) "$initializer did not update the repository-side hard link."
+    if (-not $IsWindows -or $initializer -eq 'pwsh') {
+        Assert-Equal $internalMetadataBefore (Get-FileMetadataSnapshot $internalPath) "$initializer did not preserve repository file metadata."
+    }
+    [IO.File]::WriteAllText($internalPath, "repository only`n", $utf8NoBom)
+    Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer left the repository file linked to the external target."
+}
+
+function Test-BashContentReplacementPermissionOnNativeFileSystem {
+    $script = @'
+set -euo pipefail
+fixture="$(mktemp -d "$HOME/csharp-template-init-permission.XXXXXXXX")"
+root="$fixture/repo"
+mkdir -p "$root" "$fixture/tmp"
+cleanup() {
+  chmod u+w "$root" 2>/dev/null || true
+  rm -rf -- "$fixture"
+}
+trap cleanup EXIT
+
+tar \
+  --exclude='./.git' \
+  --exclude='./.jj' \
+  --exclude='./.work' \
+  --exclude='./bin' \
+  --exclude='./obj' \
+  --exclude='./artifacts' \
+  -cf - . | tar -C "$root" -xf -
+
+snapshot() {
+  (
+    cd "$root"
+    find . -printf '%y|%P|%m|%s|%T@\n' | sort
+    find . -type f -print0 | sort -z | xargs -0 sha256sum
+  )
+}
+
+chmod a-w "$root"
+[ -w "$root/README.md" ]
+if [ -w "$root" ]; then
+  printf '%s\n' 'SKIP bash-native-content-replacement-permission-preflight: filesystem does not expose Unix directory modes'
+  exit 0
+fi
+before="$(snapshot)"
+set +e
+output="$({
+  cd "$root"
+  TMPDIR="$fixture/tmp" bash ./scripts/init.sh \
+    --project-name Acme.ReplacementPermission \
+    --author 'Permission Author' \
+    --author-email permission@example.invalid \
+    --github-owner safe-owner \
+    --description 'Replacement permission regression' \
+    --year 2042 \
+    --keep-script
+} 2>&1)"
+exit_code=$?
+set -e
+[ "$exit_code" -ne 0 ]
+grep -qi 'parent is not writable' <<< "$output"
+! grep -q 'Preflight validated' <<< "$output"
+! grep -qi 'rollback' <<< "$output"
+[ "$before" = "$(snapshot)" ]
+! find "$root" -name '.csharp-template-init-*' -print -quit | grep -q .
+printf '%s\n' 'PASS bash-native-content-replacement-permission-preflight'
+'@
+    $runner = Join-Path $repoRoot '.bash-permission-test.sh'
+    [IO.File]::WriteAllText($runner, $script.Replace("`r`n", "`n"), $utf8NoBom)
+    try {
+        $null = Invoke-Native 'bash' @('./.bash-permission-test.sh') $repoRoot
+    }
+    finally {
+        Remove-Item -LiteralPath $runner -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-ContentReplacementPermissionPreflight([string]$initializer) {
+    if ($IsWindows -and $initializer -eq 'bash') {
+        Test-BashContentReplacementPermissionOnNativeFileSystem
+        return
+    }
+
+    $projectName = 'Acme.ReplacementPermission'
+    $root = Join-Path $tempRoot "replacement-permission-$initializer"
+    Copy-Template $root
+    $target = Join-Path $root 'README.md'
+    $originalDirectorySecurity = $null
+    $originalFileSecurity = $null
+    $originalDirectoryMode = $null
+
+    try {
+        if ($IsWindows) {
+            $sections = [Security.AccessControl.AccessControlSections]::Access
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $directorySecurity = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($root), $sections)
+            $originalDirectorySecurity = $directorySecurity.GetSecurityDescriptorSddlForm($sections)
+            $directorySecurity.SetAccessRuleProtection($true, $true)
+            $directorySecurity.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $identity,
+                [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
+                [Security.AccessControl.AccessControlType]::Deny
+            ))
+            [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($root), $directorySecurity)
+
+            $fileSecurity = [IO.FileSystemAclExtensions]::GetAccessControl([IO.FileInfo]::new($target), $sections)
+            $originalFileSecurity = $fileSecurity.GetSecurityDescriptorSddlForm($sections)
+            $fileSecurity.SetAccessRuleProtection($true, $true)
+            $fileSecurity.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                $identity,
+                [Security.AccessControl.FileSystemRights]::Delete,
+                [Security.AccessControl.AccessControlType]::Deny
+            ))
+            [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($target), $fileSecurity)
+        }
+        else {
+            $originalDirectoryMode = [IO.File]::GetUnixFileMode($root)
+            $writeModes =
+                [IO.UnixFileMode]::UserWrite -bor
+                [IO.UnixFileMode]::GroupWrite -bor
+                [IO.UnixFileMode]::OtherWrite
+            [IO.File]::SetUnixFileMode($root, $originalDirectoryMode -band (-bnot $writeModes))
+        }
+
+        $writeProbe = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+        $writeProbe.Dispose()
+
+        $before = Get-TreeSnapshot $root
+        $directoryMetadataBefore = Get-DirectoryMetadataSnapshot $root
+        $fileMetadataBefore = Get-FileMetadataSnapshot $target
+        $arguments = @(
+            '--project-name', $projectName,
+            '--author', 'Permission Author',
+            '--author-email', 'permission@example.invalid',
+            '--github-owner', 'safe-owner',
+            '--description', 'Replacement permission regression',
+            '--year', '2042',
+            '--keep-script'
+        )
+        $result = if ($initializer -eq 'pwsh') {
+            Invoke-Native 'pwsh' @(
+                '-NoProfile',
+                '-File', './scripts/init.ps1',
+                '-ProjectName', $projectName,
+                '-Author', 'Permission Author',
+                '-AuthorEmail', 'permission@example.invalid',
+                '-GitHubOwner', 'safe-owner',
+                '-Description', 'Replacement permission regression',
+                '-Year', '2042',
+                '-KeepScript'
+            ) $root -ExpectFailure
+        }
+        else {
+            Invoke-Native 'bash' (@('./scripts/init.sh') + $arguments) $root -ExpectFailure
+        }
+
+        Assert-True ($result.Output -match '(?i)(directory entry cannot be replaced|sibling temporary file|not writable|not traversable)') "$initializer did not report the content replacement permission failure clearly: $($result.Output)"
+        Assert-True ($result.Output -notmatch 'Preflight validated') "$initializer started mutations after the content replacement permission failure."
+        Assert-True ($result.Output -notmatch '(?i)rollback') "$initializer attempted rollback for a preflight-only failure."
+        Assert-True (@(Compare-Object $before (Get-TreeSnapshot $root)).Count -eq 0) "$initializer changed the tree after the content replacement permission failure."
+        Assert-Equal $directoryMetadataBefore (Get-DirectoryMetadataSnapshot $root) "$initializer changed parent ACL/mode, attributes, or timestamps during content preflight."
+        Assert-Equal $fileMetadataBefore (Get-FileMetadataSnapshot $target) "$initializer changed target ACL/mode, attributes, or timestamps during content preflight."
+        $temporaryFiles = @(Get-ChildItem -LiteralPath $root -Force -Recurse -Filter '.csharp-template-init-*')
+        Assert-True ($temporaryFiles.Count -eq 0) "$initializer left a sibling temporary file after the content replacement permission failure."
+    }
+    finally {
+        if ($IsWindows) {
+            if ($originalFileSecurity) {
+                $security = [Security.AccessControl.FileSecurity]::new()
+                $security.SetSecurityDescriptorSddlForm($originalFileSecurity, $sections)
+                [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($target), $security)
+            }
+            if ($originalDirectorySecurity) {
+                $security = [Security.AccessControl.DirectorySecurity]::new()
+                $security.SetSecurityDescriptorSddlForm($originalDirectorySecurity, $sections)
+                [IO.FileSystemAclExtensions]::SetAccessControl([IO.DirectoryInfo]::new($root), $security)
+            }
+        }
+        elseif ($null -ne $originalDirectoryMode) {
+            [IO.File]::SetUnixFileMode($root, $originalDirectoryMode)
+        }
+    }
+}
+
+function Test-LateFailureRollback([string]$initializer) {
+    $projectName = 'Acme.Rollback'
+    $root = Join-Path $tempRoot "rollback-$initializer"
+    $externalRoot = Join-Path $tempRoot "rollback-external-$initializer"
+    Copy-Template $root
+    [IO.Directory]::CreateDirectory($externalRoot) | Out-Null
+    $internalHardLink = Join-Path $root 'README.md'
+    $externalHardLink = Join-Path $externalRoot 'README.md'
+    [IO.File]::Copy($internalHardLink, $externalHardLink)
+    Remove-Item -LiteralPath $internalHardLink -Force
+    New-Item -ItemType HardLink -Path $internalHardLink -Target $externalHardLink | Out-Null
+    if ($IsWindows -and $initializer -eq 'pwsh') {
+        Protect-FileAccessRules $internalHardLink
+    }
+    $externalBefore = Get-TreeSnapshot $externalRoot
+    $internalMetadataBefore = Get-FileMetadataSnapshot $internalHardLink
+
+    if ($initializer -eq 'pwsh') {
+        $wrapper = Join-Path $tempRoot 'late-failure-wrapper.ps1'
+        $wrapperText = @'
+param([string]$Root)
+$ErrorActionPreference = 'Stop'
+$script:moveCount = 0
+function Move-Item {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LiteralPath,
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+    $script:moveCount++
+    if ($script:moveCount -eq 2) {
+        throw 'Injected late move I/O failure.'
+    }
+    Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination
+}
+Set-Location $Root
+& ./scripts/init.ps1 `
+    -ProjectName Acme.Rollback `
+    -Author 'Rollback Author' `
+    -AuthorEmail rollback@example.invalid `
+    -GitHubOwner safe-owner `
+    -Description 'Rollback regression' `
+    -Year 2042 `
+    -KeepScript
+'@
+        [IO.File]::WriteAllText($wrapper, $wrapperText.Replace("`r`n", "`n"), $utf8NoBom)
+        $before = Get-TreeSnapshot $root
+        $result = Invoke-Native 'pwsh' @('-NoProfile', '-File', $wrapper, '-Root', $root) $root -ExpectFailure
+    }
+    else {
+        $shimDirectory = Join-Path $root '.test-shim'
+        [IO.Directory]::CreateDirectory($shimDirectory) | Out-Null
+        $stateName = "csharp-init-mv-$([Guid]::NewGuid().ToString('N'))"
+        $realMove = (Invoke-Native 'bash' @('-c', 'command -v mv') $root).Output.Trim()
+        $shim = @"
+#!/usr/bin/env bash
+state='./.test-shim/$stateName'
+count=0
+if [ "`$1" = '-f' ]; then
+  exec '$realMove' "`$@"
+fi
+[ ! -f "`$state" ] || count="`$(cat "`$state")"
+count=`$((count + 1))
+printf '%s' "`$count" > "`$state"
+if [ "`$count" -eq 2 ]; then
+  echo 'injected late move I/O failure' >&2
+  exit 73
+fi
+exec '$realMove' "`$@"
+"@
+        [IO.File]::WriteAllText((Join-Path $shimDirectory 'mv'), $shim.Replace("`r`n", "`n"), $utf8NoBom)
+        $null = Invoke-Native 'bash' @('-c', 'chmod +x ./.test-shim/mv') $root
+        $before = Get-TreeSnapshot $root
+        $result = Invoke-BashInitializer $root $projectName 'Rollback Author' 'rollback@example.invalid' 'safe-owner' 'Rollback regression' '2042' -ExpectFailure -PathPrefix './.test-shim'
+        $null = Invoke-Native 'bash' @('-c', "rm -f './.test-shim/$stateName'") $root
+    }
+
+    $after = Get-TreeSnapshot $root
+    Assert-True ($result.Output -match '(?i)(rolled back|rollback)') "$initializer did not report rollback after the late failure."
+    Assert-True (@(Compare-Object $before $after).Count -eq 0) "$initializer did not restore the complete tree after the late failure."
+    if (-not $IsWindows -or $initializer -eq 'pwsh') {
+        Assert-Equal $internalMetadataBefore (Get-FileMetadataSnapshot $internalHardLink) "$initializer rollback did not restore repository file metadata."
+    }
+    Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer rollback changed the external hard-linked target."
+    [IO.File]::WriteAllText($internalHardLink, "repository rollback only`n", $utf8NoBom)
+    Assert-True (@(Compare-Object $externalBefore (Get-TreeSnapshot $externalRoot)).Count -eq 0) "$initializer rollback left the repository file linked to the external target."
 }
 
 function Get-WorkflowIdentityEnvironment([string]$root) {
@@ -529,6 +1068,8 @@ try {
     $bashRoot = Join-Path $tempRoot 'bash'
     Copy-Template $pwshRoot
     Copy-Template $bashRoot
+    Add-LocalData $pwshRoot
+    Add-LocalData $bashRoot
 
     Test-ScriptSyntax $pwshRoot
     Test-PowerShellGitFallbacks
@@ -546,6 +1087,8 @@ try {
     $null = Invoke-BashInitializer $bashRoot $projectName $author $authorEmail $githubOwner $description $year
 
     Assert-TreesEqual $pwshRoot $bashRoot
+    Assert-LocalDataPreserved $pwshRoot $projectName
+    Assert-LocalDataPreserved $bashRoot $projectName
     Assert-GeneratedValues $pwshRoot $projectName $author $authorEmail $githubOwner $description $year
     Test-GeneratedSyntax $pwshRoot
     Test-WorkflowIdentity $pwshRoot $author $authorEmail
@@ -554,13 +1097,47 @@ try {
     Test-RejectedInput 'bash' 'newline'
     Test-RejectedInput 'pwsh' 'owner'
     Test-RejectedInput 'bash' 'owner'
+    Test-PreflightCollision 'pwsh' 'rename'
+    Test-PreflightCollision 'bash' 'rename'
+    Test-PreflightCollision 'pwsh' 'settings'
+    Test-PreflightCollision 'bash' 'settings'
+    Test-LinkSafety 'pwsh' 'file'
+    Test-LinkSafety 'bash' 'file'
+    Test-LinkSafety 'pwsh' 'directory'
+    Test-LinkSafety 'bash' 'directory'
+    Test-HardLinkContentIsolation 'pwsh'
+    Test-HardLinkContentIsolation 'bash'
+    Test-ContentReplacementPermissionPreflight 'pwsh'
+    Test-ContentReplacementPermissionPreflight 'bash'
+    Test-LateFailureRollback 'pwsh'
+    Test-LateFailureRollback 'bash'
 
     if (-not $SkipBuild) {
-        Test-BuildAndTests $pwshRoot $projectName
-        Test-BuildAndTests $bashRoot $projectName
+        $cleanProjectName = 'Acme.CleanInit'
+        $cleanPwshRoot = Join-Path $tempRoot 'clean-pwsh'
+        $cleanBashRoot = Join-Path $tempRoot 'clean-bash'
+        Copy-Template $cleanPwshRoot
+        Copy-Template $cleanBashRoot
+        $null = Invoke-Native 'pwsh' @(
+            '-NoProfile',
+            '-File', './scripts/init.ps1',
+            '-ProjectName', $cleanProjectName,
+            '-Author', 'Clean Build Author',
+            '-AuthorEmail', 'clean@example.invalid',
+            '-GitHubOwner', 'safe-owner',
+            '-Description', 'Clean build regression',
+            '-Year', '2042',
+            '-KeepScript'
+        ) $cleanPwshRoot
+        $null = Invoke-BashInitializer $cleanBashRoot $cleanProjectName 'Clean Build Author' 'clean@example.invalid' 'safe-owner' 'Clean build regression' '2042'
+        Assert-TreesEqual $cleanPwshRoot $cleanBashRoot
+        Test-GeneratedSyntax $cleanPwshRoot
+        Test-GeneratedSyntax $cleanBashRoot
+        Test-BuildAndTests $cleanPwshRoot $cleanProjectName
+        Test-BuildAndTests $cleanBashRoot $cleanProjectName
     }
 
-    Write-Host 'PASS: PowerShell and Bash initialization are non-cascading, equivalent, syntax-valid, and injection-safe.' -ForegroundColor Green
+    Write-Host 'PASS: PowerShell and Bash initialization are scoped, link-safe, transactional, collision-safe, non-cascading, equivalent, syntax-valid, and injection-safe.' -ForegroundColor Green
 }
 finally {
     if (Test-Path -LiteralPath $tempRoot) {

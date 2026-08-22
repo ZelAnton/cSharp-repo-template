@@ -3,11 +3,11 @@
 # Initializes this template into a concrete C# project (POSIX counterpart of
 # init.ps1 — use whichever matches your shell; both do the same thing).
 #
-# Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
-# __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder
-# names, then removes the template-only files (TEMPLATE.md,
-# docs/AGENT-INIT-GUIDE.md, scripts/tests/init-substitution.tests.ps1) and —
-# unless --keep-script — both initializers (init.sh and init.ps1).
+# Replaces placeholder tokens only in the template-owned files listed by
+# scripts/init-plan.tsv, moves the listed project files to their generated paths,
+# and removes the listed template-only files. Unless --keep-script is supplied,
+# it also removes both initializers (init.sh and init.ps1). The complete plan is
+# validated before the first write; an existing target leaves the tree unchanged.
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name Acme.Widgets \
@@ -20,7 +20,7 @@
 # GitHub owner must be a valid account-path segment. Edit LICENSE / the .csproj
 # afterwards to refine them.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 project_name=""
 author=""
@@ -93,8 +93,8 @@ if [[ ! "$github_owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; the
   die "invalid --github-owner '$github_owner'. Use 1-39 letters, digits, or hyphens, with no leading or trailing hyphen."
 fi
 
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
+script_dir="$(cd -P "$(dirname "$0")" && pwd -P)"
+repo_root="$(cd -P "$script_dir/.." && pwd -P)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
 
@@ -140,72 +140,360 @@ replace_tokens() {
   printf '%s%s' "$output" "$rest"
 }
 
-echo "==> Initializing template as '$project_name'"
+plan_path="$script_dir/init-plan.tsv"
+[ -f "$plan_path" ] || die "initialization plan is missing: scripts/init-plan.tsv. No files were changed."
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry
-#    the literal token strings as search keys, so substituting inside them would
-#    corrupt the sibling script. Excluded dirs (.git/.jj/bin/obj) are pruned.
-changed=0
-while IFS= read -r -d '' file; do
-  case "$file" in
-    "$self"|"$sibling_ps1") continue ;;
+resolve_plan_path() {
+  local path_template="$1"
+  local relative="${path_template//\{ProjectName\}/$project_name}"
+  case "$relative" in
+    ""|/*|*\\*|.|..|./*|../*|*/./*|*/../*|*/.|*/..|*//*)
+      die "unsafe path '$path_template' in scripts/init-plan.tsv. No files were changed." ;;
   esac
-  # Skip binary files: they carry no tokens, and reading them through a shell
-  # command substitution strips NUL bytes, which would corrupt the file on rewrite.
-  # The template ships none, but a downstream user may add e.g. a strong-name key
-  # or a NuGet package icon before running init.
-  case "$file" in
-    *.snk|*.pfx|*.png|*.jpg|*.jpeg|*.gif|*.ico|*.zip) continue ;;
-  esac
-  case "$file" in
-    *.csproj|*.props|*.targets|*.slnx|*.config)
-      mode=xml ;;
+  printf '%s' "$relative"
+}
+
+path_exists() { [ -e "$1" ] || [ -L "$1" ]; }
+is_link_or_reparse() { [ -L "$1" ] || [ -n "$(readlink "$1" 2>/dev/null || true)" ]; }
+
+assert_no_link_components() {
+  local relative="$1"
+  local role="$2"
+  local current="$repo_root"
+  local component
+  local -a components=()
+  IFS='/' read -ra components <<< "$relative"
+  for component in "${components[@]}"; do
+    current="$current/$component"
+    ! is_link_or_reparse "$current" || die "unsafe symbolic link or reparse point in $role path '$relative'. No files were changed."
+  done
+}
+
+assert_changeable_parent() {
+  local path="$1"
+  local relative="$2"
+  local role="$3"
+  local parent
+  parent="$(dirname "$path")"
+  while ! path_exists "$parent"; do
+    [ "$parent" != "$repo_root" ] || break
+    parent="$(dirname "$parent")"
+  done
+  [ -d "$parent" ] || die "$role parent is not a directory: $relative. No files were changed."
+  [ -w "$parent" ] || die "$role parent is not writable: $relative. No files were changed."
+  [ -x "$parent" ] || die "$role parent is not traversable: $relative. No files were changed."
+}
+
+assert_no_link_components "scripts/init-plan.tsv" "plan"
+
+declare -a plan_kinds=()
+declare -a plan_sources=()
+declare -a plan_destinations=()
+line_number=0
+while IFS=$'\t' read -r kind source destination extra || [ -n "${kind:-}${source:-}${destination:-}${extra:-}" ]; do
+  line_number=$((line_number + 1))
+  kind="${kind%$'\r'}"
+  source="${source%$'\r'}"
+  destination="${destination%$'\r'}"
+  extra="${extra%$'\r'}"
+  case "$kind" in
+    ""|\#*) continue ;;
+    content|remove)
+      [ -n "$source" ] && [ -z "$destination" ] && [ -z "$extra" ] ||
+        die "invalid entry at scripts/init-plan.tsv:$line_number. No files were changed." ;;
+    directory|move|activate)
+      [ -n "$source" ] && [ -n "$destination" ] && [ -z "$extra" ] ||
+        die "invalid entry at scripts/init-plan.tsv:$line_number. No files were changed." ;;
     *)
-      mode=raw ;;
+      die "invalid entry at scripts/init-plan.tsv:$line_number. No files were changed." ;;
   esac
-  # Preserve trailing newlines: append a sentinel before capture, strip it after.
-  content="$(cat "$file"; printf x)"; content="${content%x}"
-  orig="$content"
-  content="$(replace_tokens "$content" "$mode"; printf x)"; content="${content%x}"
-  if [ "$content" != "$orig" ]; then
-    printf '%s' "$content" > "$file"
-    changed=$((changed + 1))
-  fi
-done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name bin -o -name obj \) -prune -o -type f -print0)
-echo "    Updated contents in $changed file(s)."
 
-# 2) Rename files and folders whose name contains the project-name token. -depth
-#    processes children before parents so a renamed dir doesn't invalidate paths
-#    (deepest paths first, mirroring init.ps1's length-descending sort).
-while IFS= read -r -d '' item; do
-  case "$item" in
-    */.git/*|*/.jj/*|*/bin/*|*/obj/*) continue ;;
+  plan_kinds[${#plan_kinds[@]}]="$kind"
+  plan_sources[${#plan_sources[@]}]="$(resolve_plan_path "$source")"
+  if [ -n "$destination" ]; then
+    plan_destinations[${#plan_destinations[@]}]="$(resolve_plan_path "$destination")"
+  else
+    plan_destinations[${#plan_destinations[@]}]=""
+  fi
+done < "$plan_path"
+
+[ "${#plan_kinds[@]}" -gt 0 ] || die "initialization plan is empty: scripts/init-plan.tsv. No files were changed."
+
+declare -a planned_targets=()
+declare -a content_paths=()
+declare -a content_values=()
+declare -a directory_sources=()
+declare -a directory_targets=()
+declare -a move_sources=()
+declare -a move_targets=()
+declare -a remove_paths=()
+
+register_target() {
+  local target="$1"
+  local existing
+  for existing in "${planned_targets[@]-}"; do
+    [ "$existing" != "$target" ] || die "duplicate initialization target: ${target#"$repo_root/"}. No files were changed."
+  done
+  planned_targets[${#planned_targets[@]}]="$target"
+}
+
+# Build the complete mutation set and every replacement in memory before the
+# first write. Paths not listed in the plan are never inspected or modified.
+for ((i = 0; i < ${#plan_kinds[@]}; i++)); do
+  kind="${plan_kinds[$i]}"
+  source_relative="${plan_sources[$i]}"
+  destination_relative="${plan_destinations[$i]}"
+  source="$repo_root/$source_relative"
+  destination=""
+  if [ -n "$destination_relative" ]; then
+    destination="$repo_root/$destination_relative"
+  fi
+
+  assert_no_link_components "$source_relative" "source"
+  if [ -n "$destination_relative" ]; then
+    assert_no_link_components "$destination_relative" "destination"
+  fi
+
+  case "$kind" in
+    content)
+      path_exists "$source" || continue
+      [ -f "$source" ] || die "template content path is not a file: $source_relative. No files were changed."
+      case "$source" in
+        *.csproj|*.props|*.targets|*.slnx|*.config) mode=xml ;;
+        *) mode=raw ;;
+      esac
+      content="$(cat "$source"; printf x)"; content="${content%x}"
+      transformed="$(replace_tokens "$content" "$mode"; printf x)"; transformed="${transformed%x}"
+      if [ "$transformed" != "$content" ]; then
+        [ -w "$source" ] || die "template content path is not writable: $source_relative. No files were changed."
+        assert_changeable_parent "$source" "$source_relative" "template content replacement"
+        content_paths[${#content_paths[@]}]="$source"
+        content_values[${#content_values[@]}]="$transformed"
+      fi
+      ;;
+    directory)
+      path_exists "$source" || continue
+      [ -d "$source" ] || die "template directory path is not a directory: $source_relative. No files were changed."
+      [ "$source" != "$destination" ] || continue
+      ! path_exists "$destination" || die "initialization target collision: $destination_relative already exists. No files were changed."
+      assert_changeable_parent "$destination" "$destination_relative" "initialization target"
+      register_target "$destination"
+      directory_sources[${#directory_sources[@]}]="$source"
+      directory_targets[${#directory_targets[@]}]="$destination"
+      ;;
+    move|activate)
+      path_exists "$source" || continue
+      [ -f "$source" ] || die "template move source is not a file: $source_relative. No files were changed."
+      [ "$source" != "$destination" ] || continue
+      ! path_exists "$destination" || die "initialization target collision: $destination_relative already exists. No files were changed."
+      parent="$(dirname "$destination")"
+      if path_exists "$parent" && [ ! -d "$parent" ]; then
+        die "initialization target parent is not a directory: $destination_relative. No files were changed."
+      fi
+      assert_changeable_parent "$destination" "$destination_relative" "initialization target"
+      assert_changeable_parent "$source" "$source_relative" "template move source"
+      register_target "$destination"
+      move_sources[${#move_sources[@]}]="$source"
+      move_targets[${#move_targets[@]}]="$destination"
+      ;;
+    remove)
+      if path_exists "$source" && [ ! -f "$source" ]; then
+        die "template-only removal path is not a file: $source_relative. No files were changed."
+      fi
+      if path_exists "$source"; then
+        [ -w "$source" ] || die "template-only removal path is not writable: $source_relative. No files were changed."
+        assert_changeable_parent "$source" "$source_relative" "template-only removal"
+      fi
+      remove_paths[${#remove_paths[@]}]="$source"
+      ;;
   esac
-  dir="$(dirname "$item")"
-  base="$(basename "$item")"
-  newbase="${base//__ProjectName__/$project_name}"
-  if [ "$newbase" != "$base" ]; then
-    mv "$item" "$dir/$newbase"
-    echo "    Renamed $base -> $newbase"
-  fi
-done < <(find "$repo_root" -depth -name '*__ProjectName__*' -print0)
+done
 
-# 3) Activate the Claude Code shared settings. Shipped inert as a .template file
-#    so the template repository itself does not auto-grant any permissions.
-if [ -f "$repo_root/.claude/settings.json.template" ]; then
-  mv -f "$repo_root/.claude/settings.json.template" "$repo_root/.claude/settings.json"
-  echo "    Activated .claude/settings.json"
+echo "==> Initializing template as '$project_name'"
+echo "    Preflight validated ${#plan_kinds[@]} template-owned operation(s)."
+
+staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/csharp-template-init.XXXXXXXX")"
+declare -a backup_originals=()
+declare -a backup_copies=()
+declare -a mutated_backup_originals=()
+declare -a mutated_backup_copies=()
+declare -a completed_move_sources=()
+declare -a completed_move_targets=()
+declare -a created_directories=()
+declare -a removed_directories=()
+
+rollback_transaction() {
+  local exit_code=$?
+  local rollback_failed=0
+  local original backup existing
+  trap - ERR INT TERM
+  set +e
+
+  for existing in "${removed_directories[@]-}"; do
+    mkdir -p -- "$existing" || rollback_failed=1
+  done
+  for ((i = ${#completed_move_sources[@]} - 1; i >= 0; i--)); do
+    if path_exists "${completed_move_targets[$i]}" && ! path_exists "${completed_move_sources[$i]}"; then
+      mv -- "${completed_move_targets[$i]}" "${completed_move_sources[$i]}" || rollback_failed=1
+    fi
+  done
+  for ((i = 0; i < ${#mutated_backup_originals[@]}; i++)); do
+    original="${mutated_backup_originals[$i]}"
+    backup="${mutated_backup_copies[$i]}"
+    restore_file "$backup" "$original" || rollback_failed=1
+  done
+  for ((i = ${#created_directories[@]} - 1; i >= 0; i--)); do
+    rmdir -- "${created_directories[$i]}" 2>/dev/null || true
+  done
+  rm -rf -- "$staging_dir" || rollback_failed=1
+
+  if [ "$rollback_failed" -ne 0 ]; then
+    echo "error: initialization failed and rollback was incomplete." >&2
+  else
+    echo "error: initialization failed; all changes were rolled back." >&2
+  fi
+  [ "$exit_code" -ne 0 ] || exit_code=1
+  exit "$exit_code"
+}
+
+trap rollback_transaction ERR INT TERM
+
+backup_file() {
+  local original="$1"
+  local existing
+  local backup
+  for existing in "${backup_originals[@]-}"; do
+    [ "$existing" != "$original" ] || return 0
+  done
+  backup="$staging_dir/${#backup_originals[@]}.bak"
+  cp -p -- "$original" "$backup"
+  backup_originals[${#backup_originals[@]}]="$original"
+  backup_copies[${#backup_copies[@]}]="$backup"
+}
+
+journal_backup() {
+  local original="$1"
+  local existing
+  local i
+  for existing in "${mutated_backup_originals[@]-}"; do
+    [ "$existing" != "$original" ] || return 0
+  done
+  for ((i = 0; i < ${#backup_originals[@]}; i++)); do
+    if [ "${backup_originals[$i]}" = "$original" ]; then
+      mutated_backup_originals[${#mutated_backup_originals[@]}]="$original"
+      mutated_backup_copies[${#mutated_backup_copies[@]}]="${backup_copies[$i]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+replace_file_content() {
+  local original="$1"
+  local content="$2"
+  local temporary
+  temporary="$(mktemp "$(dirname "$original")/.csharp-template-init.XXXXXXXX")"
+  if ! cp -p -- "$original" "$temporary" ||
+    ! printf '%s' "$content" > "$temporary" ||
+    ! touch -r "$original" "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  # Replacing the directory entry prevents a hard-linked peer outside the repository from being truncated.
+  if ! mv -f -- "$temporary" "$original"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  journal_backup "$original"
+}
+
+restore_file() {
+  local backup="$1"
+  local original="$2"
+  local temporary
+  temporary="$(mktemp "$(dirname "$original")/.csharp-template-init.XXXXXXXX")"
+  if ! cp -p -- "$backup" "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  # Rollback uses the same replacement rule and never writes through an existing hard link.
+  if ! mv -f -- "$temporary" "$original"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+for path in "${content_paths[@]-}" "${remove_paths[@]-}"; do
+  if [ -n "$path" ] && [ -f "$path" ]; then
+    backup_file "$path"
+  fi
+done
+if [ "$keep_script" -ne 1 ]; then
+  for path in "$sibling_ps1" "$self"; do
+    if [ -f "$path" ]; then
+      backup_file "$path"
+    fi
+  done
 fi
 
-# 4) Remove template-only files — documentation that only applies while this is a
-#    template, not after it has been stamped into a concrete project.
-rm -f \
-  "$repo_root/TEMPLATE.md" \
-  "$repo_root/docs/AGENT-INIT-GUIDE.md" \
-  "$repo_root/scripts/tests/init-substitution.tests.ps1"
-# Drop docs/ if it's now empty (it usually isn't — linux-testing.md also lives here).
-rmdir "$repo_root/docs" 2>/dev/null || true
-rmdir "$repo_root/scripts/tests" 2>/dev/null || true
+for ((i = 0; i < ${#content_paths[@]}; i++)); do
+  relative="${content_paths[$i]#"$repo_root/"}"
+  assert_no_link_components "$relative" "content source"
+  replace_file_content "${content_paths[$i]}" "${content_values[$i]}"
+done
+echo "    Updated contents in ${#content_paths[@]} file(s)."
+
+# Destination directories are created empty; only listed files move into them.
+# Unknown files inside token-named source directories stay at their original paths.
+for ((i = 0; i < ${#directory_sources[@]}; i++)); do
+  assert_no_link_components "${directory_sources[$i]#"$repo_root/"}" "directory source"
+  assert_no_link_components "${directory_targets[$i]#"$repo_root/"}" "directory destination"
+  mkdir -- "${directory_targets[$i]}"
+  created_directories[${#created_directories[@]}]="${directory_targets[$i]}"
+done
+for ((i = 0; i < ${#move_sources[@]}; i++)); do
+  assert_no_link_components "${move_sources[$i]#"$repo_root/"}" "move source"
+  assert_no_link_components "${move_targets[$i]#"$repo_root/"}" "move destination"
+  mv -- "${move_sources[$i]}" "${move_targets[$i]}"
+  completed_move_sources[${#completed_move_sources[@]}]="${move_sources[$i]}"
+  completed_move_targets[${#completed_move_targets[@]}]="${move_targets[$i]}"
+  echo "    Moved ${move_sources[$i]#"$repo_root/"} -> ${move_targets[$i]#"$repo_root/"}"
+done
+for path in "${remove_paths[@]}"; do
+  if [ -f "$path" ]; then
+    assert_no_link_components "${path#"$repo_root/"}" "removal source"
+    rm -f -- "$path"
+    journal_backup "$path"
+    echo "    Removed ${path#"$repo_root/"}"
+  fi
+done
+
+for ((i = ${#directory_sources[@]} - 1; i >= 0; i--)); do
+  assert_no_link_components "${directory_sources[$i]#"$repo_root/"}" "directory cleanup source"
+  if rmdir -- "${directory_sources[$i]}" 2>/dev/null; then
+    removed_directories[${#removed_directories[@]}]="${directory_sources[$i]}"
+  fi
+done
+for path in "$repo_root/docs" "$repo_root/scripts/tests"; do
+  assert_no_link_components "${path#"$repo_root/"}" "directory cleanup source"
+  if rmdir -- "$path" 2>/dev/null; then
+    removed_directories[${#removed_directories[@]}]="$path"
+  fi
+done
+
+if [ "$keep_script" -ne 1 ]; then
+  if [ -f "$sibling_ps1" ]; then
+    rm -f -- "$sibling_ps1"
+    journal_backup "$sibling_ps1"
+  fi
+  if [ -f "$self" ]; then
+    rm -f -- "$self"
+    journal_backup "$self"
+  fi
+fi
+
+trap - ERR INT TERM
+rm -rf -- "$staging_dir"
 
 echo ""
 echo "Done. Next steps:"
@@ -215,9 +503,3 @@ echo "  3. Review LICENSE (author/year) and the .csproj package metadata."
 echo "  4. NuGet publishing: add the NUGET_API_KEY repo secret, or delete"
 echo "     .github/workflows/release.yml and the packaging properties in the .csproj."
 echo "  5. Commit the initialized project."
-
-# 5) Remove both initializers unless asked to keep them.
-if [ "$keep_script" -ne 1 ]; then
-  rm -f "$sibling_ps1"
-  rm -f "$self"
-fi

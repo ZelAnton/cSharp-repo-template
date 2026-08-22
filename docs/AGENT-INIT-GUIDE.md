@@ -81,10 +81,22 @@ assumptions a past agent got wrong:
    trailing hyphen. Quotes,
    backslashes, shell/Python metacharacters, and placeholder-like text are safe:
    replacement is one pass, XML destinations are escaped, and the workflow
-   identity is serialized before Bash receives it. Validation happens before any
-   file is changed. The script substitutes tokens, renames files/folders, activates
-   `.claude/settings.json` from its `.template`, and deletes `TEMPLATE.md` (and
-   itself unless `-KeepScript`).
+   identity is serialized before Bash receives it. Before any mutation, the
+   initializer loads and validates the complete `scripts/init-plan.tsv` plan and
+   rejects every existing destination, including `.claude/settings.json`. It
+   also rejects symlink, junction, and other reparse-point components in planned
+   sources, destinations, and their existing ancestors. Content updates replace
+   the repository entry instead of writing through it, so an external hard-linked
+   peer remains unchanged. If an I/O error still
+   occurs after preflight, the mutation journal restores the complete original
+   tree before the initializer reports failure.
+   `content` entries are the exact substitution boundary; no recursive scan is
+   performed. Only the listed solution, Rider settings, sample source/test, and
+   project files move to generated paths. Unknown text or binary files, `.work`,
+   caches, and unknown files inside `src/__ProjectName__` stay unchanged at their
+   original paths. The script activates `.claude/settings.json`, deletes the
+   template-only documentation, regression, and plan files, and deletes both
+   initializers unless `-KeepScript` is supplied.
 4. **Verify**:
 
    ```pwsh
@@ -258,6 +270,17 @@ wrong or obsolete.
 ## Failure log
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
+
+### 2026-08-22 — Init rewrote untracked data and overwrote local settings
+- **Symptom:** Running init after local work could rewrite arbitrary untracked
+  text, corrupt unrecognized binary files, move cache/work data, or overwrite an
+  existing `.claude/settings.json` after earlier changes had already landed.
+- **Root cause:** Both initializers recursively enumerated the checkout and used a
+  forced settings move without a complete collision preflight.
+- **Rule:** Mutate only entries in `scripts/init-plan.tsv`, validate every planned
+  source, destination, and existing ancestor before the first write, roll back
+  unexpected late failures, and keep the cross-shell preservation, link-safety,
+  collision, and rollback cases in `scripts/tests/init-substitution.tests.ps1` green.
 
 ### 2026-08-21 — Metadata could cascade or enter the release shell as code
 - **Symptom:** Quotes, shell metacharacters, line breaks, or another placeholder
