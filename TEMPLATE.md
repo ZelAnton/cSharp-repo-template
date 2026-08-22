@@ -48,9 +48,15 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    either configured identity value is empty, the PowerShell initializer uses
    `Your Name` and `you@example.com` instead. The script:
    - validates all metadata and the complete `scripts/init-plan.tsv` mutation
-     plan before writing: author, author email, and description
-     must be single-line; GitHub owner must be 1-39 letters, digits, or hyphens,
-     with no leading or trailing hyphen;
+     plan before writing: `ProjectName` must be 1-100 ASCII characters in
+     dot-separated C# identifier segments, must begin with a letter so the
+     generated `<ProjectName>-nuget` Docker volume is valid, and cannot use a
+     reserved C# keyword as a segment; because the same value names files and directories,
+     its leading basename cannot be a case-insensitive Windows device name
+     (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, or `LPT1`-`LPT9`), including
+     one followed by an extension. Author, author email, and description must be
+     single-line; GitHub owner must be 1-39 letters, digits, or hyphens, with no
+     leading or trailing hyphen;
    - substitutes only the template-owned text files listed as `content` entries
      in that plan; it never recursively scans the repository, so unknown files,
      binary data, `.work`, caches, and unknown files inside the original
@@ -131,7 +137,7 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
 
 | Token | Meaning |
 |---|---|
-| `__ProjectName__` | project / namespace / assembly / package id + file & folder names |
+| `__ProjectName__` | validated C# namespace / assembly / NuGet package id + portable file, folder, and Docker-volume prefix |
 | `__Author__` | single-line author (LICENSE, `<Authors>`, `<Copyright>`, release identity) |
 | `__AuthorEmail__` | single-line author email (release-commit identity in `release.yml`) |
 | `__GitHubOwner__` | 1-39 character GitHub owner/org path segment in repository URLs |

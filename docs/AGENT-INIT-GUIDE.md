@@ -76,9 +76,15 @@ assumptions a past agent got wrong:
    `-ProjectName` is required; the rest fall back to sensible defaults. The
    PowerShell initializer reads author and email from Git when available, then
    uses `Your Name` and `you@example.com` when Git or either configured value is
-   unavailable. Author, author email, and description must be single-line;
-   GitHub owner must be 1-39 letters, digits, or hyphens with no leading or
-   trailing hyphen. Quotes,
+   unavailable. `ProjectName` is the same value used for namespaces, assemblies,
+   NuGet PackageId, paths, and the `<ProjectName>-nuget` Docker volume, so both
+   initializers enforce their portable intersection before the first mutation: 1-100
+   ASCII characters in dot-separated C# identifier segments; a leading letter;
+   no reserved C# keyword segment; and no leading case-insensitive Windows device
+   basename (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, or `LPT1`-`LPT9`), even
+   when it is followed by an extension. Author, author email, and description
+   must be single-line; GitHub owner must be 1-39 letters, digits, or hyphens with
+   no leading or trailing hyphen. Quotes,
    backslashes, shell/Python metacharacters, and placeholder-like text are safe:
    replacement is one pass, XML destinations are escaped, and the workflow
    identity is serialized before Bash receives it. Before any mutation, the
@@ -273,6 +279,17 @@ wrong or obsolete.
 ## Failure log
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
+
+### 2026-08-22 — Project names passed validation but failed generated tooling
+- **Symptom:** C#-shaped names such as `CON`, `AUX`, `COM1`, `_Leading`, or a
+  reserved keyword could fail later as a Windows path, Docker volume, or namespace,
+  after initialization had already started.
+- **Root cause:** Both initializers checked only a simplified C# identifier regex,
+  while the same token also became a NuGet PackageId, path component, and Docker
+  volume prefix.
+- **Rule:** Validate the exact intersection before the first mutation and keep the
+  cross-shell rejection, zero-tree-mutation, valid-name build, and NUnit discovery
+  cases in `scripts/tests/init-substitution.tests.ps1` green.
 
 ### 2026-08-22 — Init rewrote untracked data and overwrote local settings
 - **Symptom:** Running init after local work could rewrite arbitrary untracked

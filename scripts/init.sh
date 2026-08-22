@@ -15,10 +15,11 @@
 #       [--github-owner acme] [--description "Widget toolkit"] \
 #       [--year 2026] [--keep-script]
 #
-# --project-name is required; the rest fall back to sensible defaults so the
-# result always builds. Author, author-email, and description must be single-line;
-# GitHub owner must be a valid account-path segment. Edit LICENSE / the .csproj
-# afterwards to refine them.
+# --project-name is required and must be a 1-100 character portable C# namespace,
+# NuGet PackageId, path component, and Docker volume prefix. The rest fall back
+# to sensible defaults so the result always builds. Author, author-email, and
+# description must be single-line; GitHub owner must be a valid account-path
+# segment. Edit LICENSE / the .csproj afterwards to refine them.
 
 set -Eeuo pipefail
 
@@ -49,23 +50,63 @@ done
 [ -n "$project_name" ] || die "--project-name is required (e.g. --project-name Acme.Widgets)."
 
 # Project / namespace / assembly / NuGet package id: letters, digits, underscores;
-# dot-separated segments allowed (e.g. Acme.Widgets). Mirrors init.ps1's regex
-# ^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$ via a per-segment check.
-# Reject a leading or trailing '.' first: `read -ra` silently drops a trailing
-# empty field, so "Acme." would otherwise slip through (the regex rejects it).
-case "$project_name" in
-  .*|*.) die "invalid --project-name '$project_name'. Use letters, digits, underscores; dot-separated segments allowed (e.g. Acme.Widgets)." ;;
-esac
-IFS='.' read -ra _segs <<< "$project_name"
-for seg in "${_segs[@]}"; do
-  case "$seg" in
-    [A-Za-z_]*) ;;
-    *) die "invalid --project-name '$project_name'. Use letters, digits, underscores; dot-separated segments allowed (e.g. Acme.Widgets)." ;;
+# dot-separated segments allowed (e.g. Acme.Widgets). LC_ALL=C makes the range
+# expressions byte-oriented even when the caller disabled globasciiranges.
+validate_project_name() {
+  local value="$1"
+  local seg keyword windows_base_name
+  local -a segments=()
+  local -a csharp_keywords=(
+    abstract as base bool break byte case catch char checked class const continue
+    decimal default delegate do double else enum event explicit extern false finally
+    fixed float for foreach goto if implicit in int interface internal is lock long
+    namespace new null object operator out override params private protected public
+    readonly ref return sbyte sealed short sizeof stackalloc static string struct switch
+    this throw true try typeof uint ulong unchecked unsafe ushort using virtual void
+    volatile while
+  )
+
+  case "$value" in
+    *$'\r'*|*$'\n'*)
+      die "Invalid ProjectName: line breaks are not allowed because project names must be portable path, NuGet PackageId, and Docker volume components. No files were changed." ;;
+    .*|*.)
+      die "Invalid ProjectName '$value': use dot-separated C# identifier segments made from ASCII letters, digits, and underscores; each segment must start with a letter or underscore. No files were changed." ;;
   esac
-  case "$seg" in
-    *[!A-Za-z0-9_]*) die "invalid --project-name '$project_name'. Use letters, digits, underscores; dot-separated segments allowed (e.g. Acme.Widgets)." ;;
+
+  IFS='.' read -r -a segments <<< "$value"
+  for seg in "${segments[@]}"; do
+    case "$seg" in
+      [A-Za-z_]*) ;;
+      *) die "Invalid ProjectName '$value': use dot-separated C# identifier segments made from ASCII letters, digits, and underscores; each segment must start with a letter or underscore. No files were changed." ;;
+    esac
+    case "$seg" in
+      *[!A-Za-z0-9_]*) die "Invalid ProjectName '$value': use dot-separated C# identifier segments made from ASCII letters, digits, and underscores; each segment must start with a letter or underscore. No files were changed." ;;
+    esac
+  done
+  if [ "${#value}" -gt 100 ]; then
+    die "Invalid ProjectName '$value': NuGet PackageId values must be 1-100 characters. No files were changed."
+  fi
+  case "$value" in
+    [A-Za-z]*) ;;
+    *) die "Invalid ProjectName '$value': the first character must be an ASCII letter because Docker volume names must start with an alphanumeric character. No files were changed." ;;
   esac
-done
+
+  for seg in "${segments[@]}"; do
+    for keyword in "${csharp_keywords[@]}"; do
+      if [ "$seg" = "$keyword" ]; then
+        die "Invalid ProjectName '$value': segment '$seg' is a reserved C# keyword and cannot be used as a namespace identifier. No files were changed."
+      fi
+    done
+  done
+
+  windows_base_name="${value%%.*}"
+  case "${windows_base_name^^}" in
+    CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])
+      die "Invalid ProjectName '$value': Windows reserves the base name '$windows_base_name' (case-insensitive), including when followed by an extension. No files were changed." ;;
+  esac
+}
+
+LC_ALL=C validate_project_name "$project_name"
 
 # Defaults (mirror init.ps1).
 if [ -z "$author" ]; then
