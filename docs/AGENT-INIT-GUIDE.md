@@ -59,7 +59,7 @@ assumptions a past agent got wrong:
     only in `.yml`/`.ps1` (see `.editorconfig`).
   - File-scoped namespaces; canonical MSBuild path props (`$(RepoRoot)`,
     `$(MainProjectDir)`) instead of `..\..\`.
-- It uses **jujutsu (`jj`)** colocated with git. Drive VCS through `jj`.
+- It uses **Git** directly with a feature-branch and pull-request workflow.
 
 ## The happy path (standard single-project init)
 
@@ -188,8 +188,8 @@ you actually produced.
   `.claude/settings.json` yourself — the self-modification classifier will (and
   should) block it. The template ships `.claude/settings.json.template`; the init
   script activates it, or the user does. Leave it inert otherwise.
-- **VCS.** The repo is jj-colocated. Use `jj` commands; if you must use raw git,
-  follow with `jj git import`.
+- **VCS.** The repo uses Git directly. Keep each task on a focused feature branch
+  and publish it through a pull request into `main`.
 
 ## Keep agent-instruction files local to the new repo
 
@@ -229,11 +229,7 @@ Append the ignore patterns, then untrack (the working copy is kept), then commit
 printf '\n/CLAUDE.md\n/AGENTS.md\n.claude/\n' >> .gitignore
 git rm -r --cached CLAUDE.md AGENTS.md .claude
 git add .gitignore && git commit -m "Keep agent instructions local"   # commit the ignore rule *and* the removals together
-# jj-colocated: jj file untrack CLAUDE.md AGENTS.md .claude  (folds .gitignore + removals into the working copy; no separate commit)
 ```
-
-`jj file untrack` only drops paths *already* matched by an ignore rule, so add the
-patterns first (jj honors `.gitignore` and `.git/info/exclude` alike).
 
 **Zero filename trace in the remote (optional).** `CLAUDE.md` and `AGENTS.md`
 aren't mentioned in `.gitignore`, so you can instead keep *them* in a local,
@@ -250,7 +246,7 @@ git rm --cached CLAUDE.md AGENTS.md
 so its rule still has to live in (or be removed from) the tracked `.gitignore` as
 above.
 
-Verify with `git status` (or `jj st`): the files must not appear as tracked or as
+Verify with `git status`: the files must not appear as tracked or as
 new/untracked-to-be-added, and a `git push` must not carry them.
 
 **Caveat — files already in the remote's history.** The untrack-and-ignore above

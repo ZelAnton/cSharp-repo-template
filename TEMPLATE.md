@@ -124,12 +124,11 @@ and conventions for agents in [CLAUDE.md](CLAUDE.md) / [AGENTS.md](AGENTS.md).
    printf '\n/CLAUDE.md\n/AGENTS.md\n.claude/\n' >> .gitignore
    git rm -r --cached CLAUDE.md AGENTS.md .claude
    git add .gitignore && git commit -m "Keep agent instructions local"   # commit the ignore rule *and* the removals
-   # jj-colocated: jj file untrack CLAUDE.md AGENTS.md .claude  (folds .gitignore + removals in; no separate commit)
    ```
 
    Appending `.claude/` last makes it win over the earlier `!.claude/...` ship
    lines. The names then appear in the pushed `.gitignore` (contents never leave
-   your machine); for zero filename trace, and the full jj-colocated steps, see
+   your machine); for a zero-filename-trace alternative, see
    [docs/AGENT-INIT-GUIDE.md](docs/AGENT-INIT-GUIDE.md). One caveat: a repo created
    via **"Use this template"** already carries these files in its initial commit on
    the remote, so untracking keeps them out of *later* commits only; for a clean
@@ -229,7 +228,7 @@ project.
 
 - [ ] Agent-instruction files (`CLAUDE.md`, `AGENTS.md`, `.claude/`) git-ignored
       and untracked so they stay local and never reach the remote — by hand,
-      before the first push (step 6 above); verify with `git status` / `jj st`.
+      before the first push (step 6 above); verify with `git status`.
 - [ ] `NUGET_API_KEY` repo secret added (only if publishing to NuGet), or
       NuGet Trusted Publishing (OIDC) configured — see `release.yml`.
 - [ ] LICENSE author/year and license choice reviewed.

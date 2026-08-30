@@ -142,26 +142,16 @@ exists.
 
 ## Version control workflow
 
-The repo uses [jujutsu (`jj`)](https://jj-vcs.github.io/jj/) (colocated with git). Use `jj` commands; the canonical workflow:
+The repo uses Git directly. Do not initialize or colocate another version-control system in the working tree. The canonical workflow is:
 
-- **Describe early.** When starting a new piece of work, immediately set the change description:
-	```
-	jj describe -m "Concise summary"
-	```
-	Small follow-ups for the same task get folded into the current change without asking — keep extending the same `jj` change, don't spawn one per edit. If the scope shifts, run `jj describe -m "..."` again so the description matches reality.
-- **Unrelated work mid-task.** If the user requests something orthogonal, ask before splitting:
-	- Current change finished? → `jj new -m "..."` (descendant).
-	- Current change still in progress? → `jj new @- -m "..."` (parallel sibling, so you can return to the original later).
+- **Inspect before editing.** Run `git status --short --branch`, preserve existing work, and keep follow-ups for the same task on the current feature branch.
+- **Unrelated work mid-task.** Do not mix unrelated changes in one branch or commit. If the working tree is dirty, ask before stashing, switching branches, or creating another worktree.
 - **Sync on the user's trigger.** When the user says `pull` (or `push`/`sync`), run the full handshake:
-	1. `jj git fetch` first — picks up any remote movement (merged PRs, CI release commits, etc.).
-	2. Rebase if `main@origin` advanced: `jj rebase -r @- -d main@origin` (or `jj rebase -d main@origin` for a stack).
-	3. Put the work on a **feature bookmark**, not `main`: `jj bookmark create <topic> -r @` the first time (then `jj bookmark move <topic> --to @` as it grows), and push only it: `jj git push --allow-new -b <topic>`.
-	4. Open a pull request into `main` (`gh pr create --base main --head <topic> --fill`, or via the GitHub UI). `main` advances only when that PR merges; afterwards `jj git fetch` brings the merge down and you `jj bookmark delete <topic>`.
+	1. `git fetch origin` first — pick up remote movement.
+	2. Rebase the feature branch onto `origin/main` if it advanced: `git rebase origin/main`.
+	3. Push the feature branch, not `main`: `git push --set-upstream origin HEAD` the first time, then `git push`.
+	4. Open a pull request into `main` (`gh pr create --base main --head <topic> --fill`, or via the GitHub UI). `main` advances only when that pull request merges.
 
-	Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is *not* protected, the old flow still works — `jj bookmark move main --to @` then `jj git push -b main`. Once branch protection requires PRs, a direct push to `main` is rejected for everyone except the release workflow's GitHub App, which sits in the ruleset's bypass list (`RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY`; see `release-token-bypass.md`).
-- **Undoing dropped work.** When the user decides to abandon something already done, reach for `jj`'s safety net rather than hand-cleanup:
-	- `jj undo` (alias of `jj op undo`) reverses the last operation — describe, edit, squash, rebase, abandon, push, all of it. Repeatable.
-	- `jj abandon <rev>` drops a specific change entirely; descendants auto-rebase.
-	- `jj restore` discards working-copy edits back to the parent's tree.
-	- `jj op log` is the full reflog if you need to go further back via `jj op restore <op-id>`.
-- **Feature bookmarks are the unit of work** — one per PR, short kebab-case topic name. Don't advance `main` locally to publish; `main` moves only via merged PRs and the release workflow's tagged commit. (Previously work lived directly on `main`; branch protection requiring PRs makes direct push the exception — see the fallback above.)
+	Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is *not* protected, `git push origin HEAD:main` remains available. Once branch protection requires pull requests, a direct push to `main` is rejected for everyone except the release workflow's GitHub App, which sits in the ruleset's bypass list (`RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY`; see `release-token-bypass.md`).
+- **Undo deliberately.** Use `git restore` for selected uncommitted changes, `git revert` for published commits, and `git reflog` for recovery. Do not use `git reset --hard`, force-push, or rewrite published history without explicit approval.
+- **Feature branches are the unit of work** — one per pull request, with a short kebab-case name. Do not advance `main` locally to publish; it moves only through merged pull requests and the release workflow's tagged commit.

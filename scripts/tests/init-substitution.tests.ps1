@@ -232,7 +232,7 @@ $bashCommand \
 
 function Copy-Template([string]$destination) {
     [IO.Directory]::CreateDirectory($destination) | Out-Null
-    $excluded = @('.git', '.jj', '.work', 'bin', 'obj', 'artifacts')
+    $excluded = @('.git', '.work', 'bin', 'obj', 'artifacts')
     foreach ($file in Get-ChildItem -LiteralPath $repoRoot -File -Force -Recurse) {
         $relative = [IO.Path]::GetRelativePath($repoRoot, $file.FullName)
         $segments = $relative -split '[\\/]'
@@ -510,7 +510,6 @@ trap cleanup EXIT
 
 tar \
   --exclude='./.git' \
-  --exclude='./.jj' \
   --exclude='./.work' \
   --exclude='./bin' \
   --exclude='./obj' \
